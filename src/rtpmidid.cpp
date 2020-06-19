@@ -432,8 +432,27 @@ void rtpmidid_t::recv_rtpmidi_event(int port, parse_buffer_t &midi_data) {
       //System messages
       switch ( current_command )
       {
-      // case 0xF0: //SysEx event
-        // break;
+      case 0xF0: { //SysEx event
+        // NOTE: By the moment, only "small" non fragmented SysEx
+        // packages are supported XXXTODO : resolve SysEx fragmentation
+        std::vector<uint8_t> sysex_bytes;
+        sysex_bytes.push_back( current_command );
+        uint8_t tmp_byte = 0x00;
+        while ( tmp_byte != 0xF7 ) { // (F7 SysEx End)
+          tmp_byte = midi_data.read_uint8();
+          sysex_bytes.push_back( tmp_byte );
+        }
+
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_sysex(&ev, sysex_bytes.size(), sysex_bytes.data());
+
+        snd_seq_ev_set_broadcast(&ev);
+        snd_seq_ev_set_source(&ev, port);
+        snd_seq_ev_set_subs(&ev);
+        snd_seq_ev_set_direct(&ev);
+        snd_seq_event_output_direct(seq.seq, &ev);
+        return;
+      } break;
       case 0xF1: //MTC Quarter Frame package
         snd_seq_ev_clear(&ev);
         snd_seq_ev_set_fixed(&ev);
