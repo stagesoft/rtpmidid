@@ -1,28 +1,39 @@
 /**
  * Real Time Protocol Music Instrument Digital Interface Daemon
- * Copyright (C) 2019 David Moreno Montero <dmoreno@coralbits.com>
+ * Copyright (C) 2019-2020 David Moreno Montero <dmoreno@coralbits.com>
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
 #pragma once
 #include "./exceptions.hpp"
-#include "./logger.hpp"
+#include "logger.hpp"
 #include <cstdint>
 #include <string_view>
 
 namespace rtpmidid {
+/**
+ * @short Parse and write to buffers to simplify safe network operations
+ *
+ * All data read and written to network is throug thse helper that know
+ * how to convert data, move the pointer over the read data, and are
+ * safe to do not do buffer overflows.
+ *
+ * It is inline in this file to give the compilers a change to properly
+ * inline it, which in most cases it should.
+ */
 struct parse_buffer_t {
   uint8_t *start;
   uint8_t *end;
@@ -188,7 +199,4 @@ struct parse_buffer_t {
   }
 };
 
-uint8_t *raw_write_uint16(uint8_t *data, uint16_t n);
-void read_label(parse_buffer_t &buffer, parse_buffer_t &label);
-void write_label(parse_buffer_t &data, const std::string_view &name);
 } // namespace rtpmidid

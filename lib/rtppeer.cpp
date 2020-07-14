@@ -1,30 +1,28 @@
 /**
  * Real Time Protocol Music Instrument Digital Interface Daemon
- * Copyright (C) 2019 David Moreno Montero <dmoreno@coralbits.com>
+ * Copyright (C) 2019-2020 David Moreno Montero <dmoreno@coralbits.com>
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
  */
-#include <time.h>
 
-#include "./exceptions.hpp"
-#include "./logger.hpp"
-#include "./netutils.hpp"
-#include "./poller.hpp"
-#include "./rtppeer.hpp"
+#include <rtpmidid/exceptions.hpp>
+#include <rtpmidid/logger.hpp>
+#include <rtpmidid/parse_buffer.hpp>
+#include <rtpmidid/rtppeer.hpp>
 
 using namespace rtpmidid;
-using namespace std::chrono_literals;
 
 /**
  * @short Generic peer constructor
@@ -288,7 +286,6 @@ void rtppeer::parse_command_ck(parse_buffer_t &buffer, port_e port) {
     latency = ck3 - ck1;
     waiting_ck = false;
     INFO("Latency {}: {:.2f} ms (client / 2)", remote_name, latency / 10.0);
-    ck_timeout.disable();
     ck_event(latency / 10.0);
   } break;
   case 2: {
@@ -358,9 +355,6 @@ void rtppeer::send_ck0() {
   // retbuffer.print_hex();
 
   send_event(std::move(retbuffer), MIDI_PORT);
-
-  ck_timeout =
-      poller.add_timer_event(5s, [this] { disconnect_event(CK_TIMEOUT); });
 }
 
 void rtppeer::parse_feedback(parse_buffer_t &buffer) {

@@ -1,19 +1,20 @@
 /**
- * Real Time Protocol Music Industry Digital Interface Daemon
- * Copyright (C) 2019 David Moreno Montero <dmoreno@coralbits.com>
+ * Real Time Protocol Music Instrument Digital Interface Daemon
+ * Copyright (C) 2019-2020 David Moreno Montero <dmoreno@coralbits.com>
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
 #include <arpa/inet.h>
@@ -22,17 +23,16 @@
 #include <sys/types.h>
 
 #include <arpa/inet.h>
-#include <fmt/format.h>
 #include <netinet/in.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "./logger.hpp"
-#include "./netutils.hpp"
-#include "./poller.hpp"
-#include "./rtpclient.hpp"
+#include <rtpmidid/logger.hpp>
+#include <rtpmidid/parse_buffer.hpp>
+#include <rtpmidid/poller.hpp>
+#include <rtpmidid/rtpclient.hpp>
 
 using namespace std::chrono_literals;
 using namespace rtpmidid;
@@ -212,15 +212,26 @@ void rtpclient::connect_to(const std::string &address,
  */
 void rtpclient::connected() {
   connect_timer.disable();
+
   peer.ck_event.connect([this](float ms) {
+    ck_timeout.disable();
     if (timerstate < 6) {
-      timer_ck = poller.add_timer_event(1500ms, [this] { peer.send_ck0(); });
+      timer_ck =
+          poller.add_timer_event(1500ms, [this] { send_ck0_with_timeout(); });
       timerstate++;
     } else {
-      timer_ck = poller.add_timer_event(10s, [this] { peer.send_ck0(); });
+      timer_ck =
+          poller.add_timer_event(10s, [this] { send_ck0_with_timeout(); });
     }
   });
+  send_ck0_with_timeout();
+}
+
+void rtpclient::send_ck0_with_timeout() {
   peer.send_ck0();
+  ck_timeout = poller.add_timer_event(5s, [this] {
+    peer.disconnect_event(rtppeer::disconnect_reason_e::CK_TIMEOUT);
+  });
 }
 
 void rtpclient::sendto(const parse_buffer_t &pb, rtppeer::port_e port) {
