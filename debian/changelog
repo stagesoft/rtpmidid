@@ -1,4 +1,11 @@
-rtpmidid (21.11) unstable; urgency=medium
+rtpmidid (21.11~8~g86f35) unstable; urgency=medium
+
+  * Fix MTC quarter frame packet length
+  
+ -- Ion Reguera <ion@stagelab.coop>  Wed, 06 Jul 2022 17:49:04 +0200
+
+
+ rtpmidid (21.11) unstable; urgency=medium
 
   * Several MIDI packets in a single packet. This solves several issues 
     with third party implementations.
