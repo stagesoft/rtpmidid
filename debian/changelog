@@ -1,3 +1,15 @@
+rtpmidid (26.01~1~g7f552) stable; urgency=high
+
+  * Development version. Check `git log`.
+
+ -- Stagelab <ion@stagelab.coop>  Tue, 12 May 2026 21:56:49 +0200
+
+rtpmidid (26.01-1stagelab1) stable; urgency=high
+
+  * Fix heap-use-after-free in rtppeer_t::disconnect() — send_goodbye()'s status_change_event fan-out destroyed the owning rtpserverpeer_t mid-call, leaving disconnect() reading freed memory at reset(). disconnect() now holds a self-shared_ptr (via enable_shared_from_this + weak_from_this().lock()) so the object survives across the synchronous signal storm. Pending upstream PR to davidmoreno/rtpmidid.
+
+ -- Stagelab <ion@stagelab.coop>  Tue, 12 May 2026 21:30:00 +0200
+
 rtpmidid (26.01) stable; urgency=medium
 
   * Docker support: Added Dockerfile, docker-compose, and comprehensive Docker documentation
