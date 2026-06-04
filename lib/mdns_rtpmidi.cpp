@@ -416,6 +416,16 @@ void rtpmidid::mdns_rtpmidi_t::client_callback(avahi_client_state_e state_) {
     INFO("Client running");
     setup_service_browser();
     setup_entry_group();
+    /* Commit any announcements queued before the Avahi client finished
+     * connecting. announce_rtpmidi() stores every service in `announcements`
+     * and calls announce_all(), but that bails out with "No group to announce
+     * to" while `group` is still null. Without re-running announce_all() here
+     * those queued services are NEVER published: on a cold boot where
+     * rtpmidid starts before avahi-daemon is ready, the host then advertises
+     * nothing over mDNS and stays undiscoverable until rtpmidid is restarted.
+     * announce_all() is idempotent (it resets the group and re-adds the whole
+     * `announcements` vector), so this is safe even when nothing is queued. */
+    announce_all();
     break;
   case AVAHI_CLIENT_FAILURE: {
     auto avahi_errno = avahi_client_errno(client);

@@ -1,3 +1,18 @@
+rtpmidid (26.06~1stagelab1) stable; urgency=high
+
+  * mdns: commit queued service announcements on AVAHI_CLIENT_S_RUNNING.
+    announce_rtpmidi() stores every service in `announcements` and calls
+    announce_all(), which bails out ("No group to announce to") while the
+    Avahi client is not yet connected. setup_entry_group() then created the
+    group on S_RUNNING but never re-committed the queued services, so on a
+    cold boot where rtpmidid starts before avahi-daemon the host advertised
+    nothing over mDNS and stayed undiscoverable until a manual restart
+    (CUEMS: controller MTC export invisible to nodes -> nodes get no MTC).
+    client_callback() now calls announce_all() after setup_entry_group();
+    it is idempotent so it is safe when no service is queued.
+
+ -- Stagelab <ion@stagelab.coop>  Thu, 04 Jun 2026 16:30:00 +0200
+
 rtpmidid (26.01~1~g7f552) stable; urgency=high
 
   * Development version. Check `git log`.
