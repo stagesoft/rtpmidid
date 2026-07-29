@@ -19,6 +19,7 @@
 
 #include <rtpmidid/logger.hpp>
 #include <algorithm>
+#include <cstdlib>
 #include <rtpmidid/exceptions.hpp>
 #include <string>
 
@@ -55,6 +56,32 @@ static constexpr size_t ansi_color_length(logger_level_t level) {
 
 static constexpr const char *ansi_color_reset() { return "\033[0m"; }
 
+// journald parses a leading sd-daemon "<N>" marker (byte 0 only), strips it,
+// and stamps the record's PRIORITY. Without it every stdout line is recorded
+// as priority 6 (info), so `journalctl -p 4` / `cuems-logs -e` can never
+// surface this daemon's warnings or errors. systemd sets JOURNAL_STREAM in
+// the environment exactly when stdout/stderr are wired to the journal, so
+// terminal runs keep the ANSI-colored output byte-for-byte.
+static constexpr const char *syslog_level_prefix(logger_level_t level) {
+  switch (level) {
+  case DEBUG:
+    return "<7>";
+  case INFO:
+    return "<6>";
+  case WARNING:
+    return "<4>";
+  case ERROR:
+    return "<3>";
+  default:
+    return "<6>";
+  }
+}
+
+static bool under_journal() {
+  static const bool v = (getenv("JOURNAL_STREAM") != nullptr);
+  return v;
+}
+
 static constexpr const char *basename(const char *filename) {
   const char *p = filename;
   while (*filename) {
@@ -70,9 +97,16 @@ logger_t::buffer_t::iterator
 logger_t::log_preamble(logger_level_t level, const char *filename, int lineno) {
   auto it = buffer.begin();
 
-  it = FMT::format_to(it, "{}[{}] {}:{}", ansi_color(level), level,
-                      basename(filename), lineno);
-  for (int i = it - buffer.begin() - ansi_color_length(level); i < 40; i++) {
+  // Under the journal: "<N>" priority marker instead of ANSI color (escape
+  // bytes would be stored literally in the journal). Both are display-only
+  // prefixes, so the 40-column padding discounts whichever one was emitted.
+  const bool journald = under_journal();
+  const char *prefix = journald ? syslog_level_prefix(level) : ansi_color(level);
+  const size_t prefix_len = journald ? 3 : ansi_color_length(level);
+
+  it = FMT::format_to(it, "{}[{}] {}:{}", prefix, level, basename(filename),
+                      lineno);
+  for (int i = it - buffer.begin() - prefix_len; i < 40; i++) {
     *it = ' ';
     it++;
   }
@@ -81,7 +115,9 @@ logger_t::log_preamble(logger_level_t level, const char *filename, int lineno) {
 }
 
 void logger_t::log_postamble(buffer_t::iterator it) {
-  it = FMT::format_to(it, "{}", ansi_color_reset());
+  if (!under_journal()) {
+    it = FMT::format_to(it, "{}", ansi_color_reset());
+  }
   *it = '\0';
   std::cout << buffer.data() << std::endl;
 }
