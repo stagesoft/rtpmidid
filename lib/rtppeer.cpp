@@ -294,8 +294,11 @@ void rtppeer_t::parse_command_ck(io_bytes_reader &buffer, port_e port) {
     count = 2;
     latency = ck3 - ck1;
     waiting_ck = false;
-    INFO("Latency {}: {:.2f} ms (client / 2)", std::string_view(remote_name),
-         latency / 10.0);
+    // DEBUG, not INFO: the CK clock-sync exchange fires every ~25s per peer
+    // for the life of the connection — as INFO it dominated the journal
+    // (thousands of lines/day saying nothing new). --verbose restores it.
+    DEBUG("Latency {}: {:.2f} ms (client / 2)", std::string_view(remote_name),
+          latency / 10.0);
     ck_event(float(latency) / 10.0f);
     stats.add_stat(std::chrono::nanoseconds((int)latency * 100));
   } break;
@@ -304,8 +307,9 @@ void rtppeer_t::parse_command_ck(io_bytes_reader &buffer, port_e port) {
     ck2 = buffer.read_uint64();
     // ck3 = buffer.read_uint64();
     latency = get_timestamp() - ck2;
-    INFO("Latency {}: {:.2f} ms (server / 3)", std::string_view(remote_name),
-         latency / 10.0);
+    // DEBUG for the same reason as the client/2 case above.
+    DEBUG("Latency {}: {:.2f} ms (server / 3)", std::string_view(remote_name),
+          latency / 10.0);
     // No need to send message
     stats.add_stat(std::chrono::nanoseconds((int)latency * 100));
     ck_event(float(latency) / 10.0f);

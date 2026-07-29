@@ -1,3 +1,12 @@
+rtpmidid (26.06~1stagelab3) stable; urgency=medium
+
+  * Demote the CK latency exchange lines (rtppeer.cpp client/2 +
+    server/3) from INFO to DEBUG: they fire every ~25s per peer for the
+    life of every connection and dominated the journal with thousands of
+    identical lines/day. --verbose restores them.
+
+ -- Ion Reguera <ion@stagelab.coop>  Wed, 29 Jul 2026 20:27:35 +0200
+
 rtpmidid (26.06~1stagelab2) stable; urgency=medium
 
   * Journal logging: emit sd-daemon <N> priority markers instead of ANSI
