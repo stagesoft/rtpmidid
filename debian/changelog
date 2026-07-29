@@ -1,3 +1,13 @@
+rtpmidid (26.06~1stagelab2) stable; urgency=medium
+
+  * Journal logging: emit sd-daemon <N> priority markers instead of ANSI
+    colors when running under systemd (JOURNAL_STREAM). Real PRIORITY on
+    every record — journalctl -p / cuems-logs -e can finally filter this
+    daemon — and no more raw escape bytes stored in the journal.
+    Terminal output unchanged.
+
+ -- Ion Reguera <ion@stagelab.coop>  Wed, 29 Jul 2026 19:49:54 +0200
+
 rtpmidid (26.06~1stagelab1) stable; urgency=high
 
   * mdns: commit queued service announcements on AVAHI_CLIENT_S_RUNNING.
