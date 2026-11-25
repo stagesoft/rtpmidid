@@ -15,6 +15,7 @@
 #include "../tests/test_case.hpp"
 #include "../tests/test_utils.hpp"
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <rtpmidid/iobytes.hpp>
 #include <rtpmidid/logger.hpp>
@@ -384,7 +385,159 @@ void a_new_session_gets_its_ck_reply_after_lost_goodbyes() {
   ASSERT_FALSE(on_old);
 }
 
+// ------------------------------------------- long run, built-in timeouts
+//
+// Opt-in: set RTPM_SOAK_SECONDS to the time to watch after the last timeout.
+// Nothing is shortened: 10 s connect timeout, 30 s reconnect, CK every 2 s and
+// then every 25 s, server peers removed after 60 s without CK. One probe note
+// a second tells whether each client is receiving. Lines start with SOAK.
+
+static int soak_seconds() {
+  const char *value = std::getenv("RTPM_SOAK_SECONDS");
+  return value ? std::atoi(value) : 0;
+}
+
+struct soak_node_t {
+  rtpclient_t client;
+  const char *label;
+  int received = 0;
+  int received_in_window = 0;
+  int last_received_s = -1;
+  bool was_up = false;
+  rtppeer_t::midi_event_t::connection_t on_midi;
+  explicit soak_node_t(const char *name) : client(name), label(name) {
+    on_midi = client.peer.midi_event.connect(
+        [this](const rtpmidid::io_bytes_reader &) { received++; });
+  }
+};
+
+struct soak_t {
+  rtpmidid::rtpserver_t server{"server", "0"};
+  std::vector<soak_node_t *> nodes;
+  std::chrono::steady_clock::time_point start =
+      std::chrono::steady_clock::now();
+  int ticks = 0;
+
+  int now_s() const {
+    return int(std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::steady_clock::now() - start)
+                   .count());
+  }
+
+  void connect(soak_node_t &node) {
+    node.client.add_server_address("127.0.0.1", std::to_string(server.port()));
+    ASSERT_TRUE(run_until([&] { return is_up(node.client); }, 15000ms));
+    node.was_up = true;
+    nodes.push_back(&node);
+    INFO("SOAK t={}s {} connected", now_s(), node.label);
+  }
+
+  // Send one probe a second for `seconds`, reporting every change.
+  void watch(int seconds) {
+    const int end = now_s() + seconds;
+    while (now_s() < end) {
+      std::vector<int> before;
+      for (auto *node : nodes)
+        before.push_back(node->received);
+      send_probe_note(server);
+      run_for(1000ms);
+      ticks++;
+      for (size_t i = 0; i < nodes.size(); i++) {
+        auto *node = nodes[i];
+        if (node->received > before[i]) {
+          node->received_in_window++;
+          node->last_received_s = now_s();
+        }
+        if (is_up(node->client) != node->was_up) {
+          node->was_up = is_up(node->client);
+          INFO("SOAK t={}s {} is now {}", now_s(), node->label,
+               node->was_up ? "UP" : "DOWN");
+        }
+      }
+      if (ticks % 30 == 0) {
+        for (auto *node : nodes) {
+          INFO("SOAK t={}s {} up={} probes received in the last 30: {} (last "
+               "at t={}s)",
+               now_s(), node->label, is_up(node->client),
+               node->received_in_window, node->last_received_s);
+          node->received_in_window = 0;
+        }
+        INFO("SOAK t={}s server peers: {}", now_s(), server.peers.size());
+      }
+    }
+  }
+
+  void inject_ck_timeout(soak_node_t &node) {
+    auto waiting = [&] {
+      return node.client.state == rtpclient_t::state_e::WaitSendCkShort ||
+             node.client.state == rtpclient_t::state_e::WaitSendCkLong;
+    };
+    ASSERT_TRUE(run_until(waiting, 30000ms));
+    INFO("SOAK t={}s injecting one CK timeout on {}", now_s(), node.label);
+    node.client.handle_event(rtpclient_t::SendCK);
+    node.client.handle_event(rtpclient_t::Timeout);
+  }
+
+  void verdict() {
+    log_server_peers("SOAK end", server);
+    bool all = true;
+    for (auto *node : nodes) {
+      const bool receiving =
+          node->last_received_s >= 0 && now_s() - node->last_received_s <= 5;
+      INFO("SOAK verdict t={}s {}: up={} receiving={} last probe at t={}s",
+           now_s(), node->label, is_up(node->client), receiving,
+           node->last_received_s);
+      all = all && receiving && is_up(node->client);
+    }
+    ASSERT_TRUE(all);
+  }
+};
+
+void soak_control_two_clients_without_timeouts() {
+  soak_t soak;
+  soak_node_t a("node-a");
+  soak_node_t b("node-b");
+  soak.connect(a);
+  soak.connect(b);
+  soak.watch(90 + soak_seconds());
+  soak.verdict();
+}
+
+void soak_control_one_client_one_timeout() {
+  soak_t soak;
+  soak_node_t a("node-a");
+  soak.connect(a);
+  soak.watch(20);
+  soak.inject_ck_timeout(a);
+  soak.watch(70 + soak_seconds());
+  soak.verdict();
+}
+
+void soak_two_clients_one_timeout_each() {
+  soak_t soak;
+  soak_node_t a("node-a");
+  soak_node_t b("node-b");
+  soak.connect(a);
+  soak.connect(b);
+  soak.watch(20);
+  soak.inject_ck_timeout(a);
+  soak.watch(90); // node-a is long stable when node-b has its own
+  soak.inject_ck_timeout(b);
+  soak.watch(soak_seconds());
+  soak.verdict();
+}
+
 int main(int argc, char **argv) {
+  if (soak_seconds() > 0) {
+    test_case_t soaks{
+        TEST(soak_control_two_clients_without_timeouts),
+        TEST(soak_control_one_client_one_timeout),
+        TEST(soak_two_clients_one_timeout_each),
+    };
+    soaks.run(argc, argv);
+    return soaks.exit_code();
+  }
+
   test_case_t testcase{
       TEST(control_one_client_recovers_after_a_ck_timeout),
       TEST(control_two_clients_both_receive),
