@@ -14,10 +14,14 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "local_alsa_listener.hpp"
+#include <algorithm>
 #include "aseq.hpp"
+#include "rtpmidid/exceptions.hpp"
 #include "factory.hpp"
 #include "json.hpp"
 #include "local_alsa_peer.hpp"
@@ -30,12 +34,19 @@ local_alsa_listener_t::local_alsa_listener_t(const std::string &name_,
                                              const std::string &hostname_,
                                              const std::string &port_,
                                              std::shared_ptr<aseq_t> aseq_,
-                                             const std::string &local_udp_port)
+                                             const std::string &local_udp_port,
+                                             int interface)
     : local_udp_port(local_udp_port), remote_name(name_), aseq(aseq_) {
 
-  add_endpoint(hostname_, port_);
+  add_endpoint(hostname_, port_, interface);
 
-  alsaport = aseq->create_port(remote_name);
+  // M2: no port, no listener (the caller decides what that means: the peer gets
+  // none, the control socket reports an error, the start fails).
+  const int created = aseq->create_port(remote_name);
+  if (created < 0)
+    throw rtpmidid::exception("Could not create the ALSA port for {}: {}",
+                              remote_name, snd_strerror(created));
+  alsaport = uint8_t(created);
   subscribe_connection = aseq->subscribe_event[alsaport].connect(
       [this](aseq_t::port_t from, const std::string &name) {
         connection_count++;
@@ -88,23 +99,65 @@ local_alsa_listener_t::~local_alsa_listener_t() {
 }
 
 void local_alsa_listener_t::add_endpoint(const std::string &hostname,
-                                         const std::string &port) {
-  DEBUG("Added endpoint for alsawaiter: {}, hostname: {}, port: {}",
-        remote_name, hostname, port);
-  bool exists = false;
+                                         const std::string &port,
+                                         int interface) {
+  DEBUG("Added endpoint for alsawaiter: {}, hostname: {}, port: {}, "
+        "interface: {}",
+        remote_name, hostname, port, interface);
 
   for (auto &endpoint : endpoints) {
-    if (endpoint.hostname == hostname && endpoint.port == port) {
-      exists = true;
-      WARNING("Endpoint {}:{} already exists. May happen if several network "
-              "interfaces. Ignoring.",
-              hostname, port);
-      break;
+    if (interface >= 0 && endpoint.interface == interface) {
+      if (endpoint.hostname == hostname && endpoint.port == port)
+        return;
+      INFO("{}: endpoint on interface {} moved {}:{} -> {}:{}", remote_name,
+           interface, endpoint.hostname, endpoint.port, hostname, port);
+      endpoint.hostname = hostname;
+      endpoint.port = port;
+      endpoints_changed();
+      return;
+    }
+    if (endpoint.interface == interface && endpoint.hostname == hostname &&
+        endpoint.port == port) {
+      DEBUG("Endpoint {}:{} already known", hostname, port);
+      return;
     }
   }
+  endpoints.push_back(endpoint_t{hostname, port, interface});
+  endpoints_changed();
+}
 
-  if (!exists)
-    endpoints.push_back(rtpmidid::rtpclient_t::endpoint_t{hostname, port});
+size_t local_alsa_listener_t::remove_discovered_endpoint(int interface) {
+  auto before = endpoints.size();
+  endpoints.erase(std::remove_if(endpoints.begin(), endpoints.end(),
+                                 [interface](const endpoint_t &endpoint) {
+                                   return endpoint.interface == interface;
+                                 }),
+                  endpoints.end());
+  if (endpoints.size() != before)
+    endpoints_changed();
+  return discovered_endpoints();
+}
+
+size_t local_alsa_listener_t::discovered_endpoints() const {
+  size_t count = 0;
+  for (auto &endpoint : endpoints)
+    count += endpoint.interface >= 0;
+  return count;
+}
+
+std::vector<rtpmidid::rtpclient_t::endpoint_t>
+local_alsa_listener_t::client_endpoints() const {
+  std::vector<rtpmidid::rtpclient_t::endpoint_t> ret;
+  for (auto &endpoint : endpoints)
+    ret.push_back({endpoint.hostname, endpoint.port});
+  return ret;
+}
+
+// A live client gets the new endpoints for its next attempt (a session that
+// is up stays); a client that has gone meanwhile is simply not told.
+void local_alsa_listener_t::endpoints_changed() {
+  if (auto client = rtpclient.lock())
+    client->replace_server_addresses(client_endpoints());
 }
 
 void local_alsa_listener_t::connect_to_remote_server(
@@ -128,7 +181,8 @@ void local_alsa_listener_t::connect_to_remote_server(
   router->connect(peer_id, rtpmidiclientworker_peer_id);
 
   rtpclient->local_base_port_str = local_udp_port;
-  rtpclient->add_server_addresses(endpoints);
+  this->rtpclient = rtpclient;
+  rtpclient->add_server_addresses(client_endpoints());
 }
 
 void local_alsa_listener_t::disconnect_from_remote_server() {
@@ -163,8 +217,9 @@ void local_alsa_listener_t::send_midi(midipeer_id_t from,
 json_t local_alsa_listener_t::status() {
   json_t jendpoints;
   for (auto &endpoint : endpoints) {
-    jendpoints.push_back(
-        json_t{{"hostname", endpoint.hostname}, {"port", endpoint.port}});
+    jendpoints.push_back(json_t{{"hostname", endpoint.hostname},
+                                {"port", endpoint.port},
+                                {"interface", endpoint.interface}});
   }
   std::string status;
   if (connection_count > 0)
@@ -209,10 +264,11 @@ json_t local_alsa_listener_t::command(const std::string &cmd,
       if (it->hostname == hostname && it->port == port) {
         DEBUG("Removing endpoint {}:{} from {}", hostname, port, remote_name);
         endpoints.erase(it);
+        endpoints_changed();
         return json_t{"ok"};
       }
-      ERROR("Try to remove endpoint {}:{} but not found", hostname, port);
     }
+    ERROR("Try to remove endpoint {}:{} but not found", hostname, port);
     return json_t{"error", "Endpoint not found"};
   }
   if (cmd == "help") {

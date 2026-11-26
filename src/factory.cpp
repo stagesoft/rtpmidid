@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "factory.hpp"
@@ -40,12 +42,12 @@ std::shared_ptr<midipeer_t>
 make_local_alsa_listener(std::shared_ptr<midirouter_t> &router,
                          const std::string &name, const std::string &hostname,
                          const std::string &port, std::shared_ptr<aseq_t> aseq,
-                         const std::string &udp_port) {
+                         const std::string &udp_port, int interface) {
   std::shared_ptr<midipeer_t> added;
   router->for_each_peer<local_alsa_listener_t>(
       [&](local_alsa_listener_t *peer) {
         if (peer->remote_name == name) {
-          peer->add_endpoint(hostname, port);
+          peer->add_endpoint(hostname, port, interface);
           added = peer->shared_from_this();
         }
       });
@@ -53,8 +55,9 @@ make_local_alsa_listener(std::shared_ptr<midirouter_t> &router,
   if (added)
     return added;
 
+  // Throws when its ALSA port cannot be made (M2): the caller decides.
   auto ret = std::make_shared<local_alsa_listener_t>(name, hostname, port, aseq,
-                                                     udp_port);
+                                                     udp_port, interface);
   return ret;
 }
 

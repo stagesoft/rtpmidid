@@ -53,10 +53,10 @@ public:
   rtpmidi_remote_handler_t(std::shared_ptr<midirouter_t>,
                            std::shared_ptr<aseq_t>);
 
-  void discover_peer(const std::string &name, const std::string &hostname,
-                     const std::string &port);
-  void remove_peer(const std::string &name, const std::string &hostname,
-                   const std::string &port);
+  void discover_peer(const std::string &name, const std::string &address,
+                     const std::string &port, int interface = -1);
+  void remove_peer(const std::string &name, const std::string &address,
+                   const std::string &port, int interface = -1);
 
   bool check_if_add_peer(const std::string &name, const std::string &hostname,
                          const std::string &port);

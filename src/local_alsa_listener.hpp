@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #pragma once
@@ -43,7 +45,18 @@ public:
   std::string local_udp_port = "0";
   std::string remote_name;
   std::string local_name;
-  std::vector<rtpmidid::rtpclient_t::endpoint_t> endpoints;
+  // N3 (1amfwm7fgu7): a discovered endpoint is one per (service, interface),
+  // its address replaced in place when the service moves; interface -1 is an
+  // endpoint given by hand ([connect_to], the control socket).
+  struct endpoint_t {
+    std::string hostname;
+    std::string port;
+    int interface = -1;
+  };
+  std::vector<endpoint_t> endpoints;
+  // The live client, not owned (the router owns it and drops it when the port
+  // loses its last subscriber): told when the endpoints change.
+  std::weak_ptr<rtpmidid::rtpclient_t> rtpclient;
   std::string hostname;
   std::string port;
 
@@ -65,14 +78,22 @@ public:
 
   local_alsa_listener_t(const std::string &name, const std::string &hostname,
                         const std::string &port, std::shared_ptr<aseq_t> aseq,
-                        const std::string &local_udp_port = "0");
+                        const std::string &local_udp_port = "0",
+                        int interface = -1);
   ~local_alsa_listener_t() override;
 
   void send_midi(midipeer_id_t from, const mididata_t &) override;
   const char *get_type() const override { return "local_alsa_listener_t"; }
   json_t status() override;
 
-  void add_endpoint(const std::string &hostname, const std::string &port);
+  void add_endpoint(const std::string &hostname, const std::string &port,
+                    int interface = -1);
+  // The service is gone from `interface`: its endpoint goes. Returns how many
+  // discovered endpoints are left.
+  size_t remove_discovered_endpoint(int interface);
+  size_t discovered_endpoints() const;
+  std::vector<rtpmidid::rtpclient_t::endpoint_t> client_endpoints() const;
+  void endpoints_changed();
   void connect_to_remote_server(const std::string &portname);
   void disconnect_from_remote_server();
 

@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #pragma once
@@ -65,7 +67,7 @@ std::shared_ptr<midipeer_t>
 make_local_alsa_listener(std::shared_ptr<midirouter_t> &router,
                          const std::string &name, const std::string &hostname,
                          const std::string &port, std::shared_ptr<aseq_t> aseq,
-                         const std::string &udp_port);
+                         const std::string &udp_port, int interface = -1);
 
 //
 std::shared_ptr<midipeer_t> make_rawmidi_peer(const std::string &name,

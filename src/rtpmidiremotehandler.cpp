@@ -37,63 +37,95 @@ rtpmidi_remote_handler_t::rtpmidi_remote_handler_t(
 
   // N1: the library hands on the address avahi resolved (and the interface,
   // used by N3), never the host name.
+  // N1: the library hands on the address avahi resolved, and the interface
+  // it was seen on (N3); never the host name. M2: nothing thrown here leaves
+  // the avahi callback.
   discover_connection = rtpmididns::mdns->discover_event.connect(
       [this](const std::string &name, const std::string &address,
-             const std::string &port,
-             int) { discover_peer(name, address, port); });
+             const std::string &port, int interface) {
+        try {
+          discover_peer(name, address, port, interface);
+        } catch (const std::exception &exc) {
+          ERROR("Discovered peer={} not added: {}", name, exc.what());
+        }
+      });
 
   remove_connection = rtpmididns::mdns->remove_event.connect(
       [this](const std::string &name, const std::string &address,
-             const std::string &port,
-             int) { remove_peer(name, address, port); });
+             const std::string &port, int interface) {
+        try {
+          remove_peer(name, address, port, interface);
+        } catch (const std::exception &exc) {
+          ERROR("Removing peer={}: {}", name, exc.what());
+        }
+      });
 }
 
 void rtpmidi_remote_handler_t::discover_peer(const std::string &name,
-                                             const std::string &hostname,
-                                             const std::string &port) {
-  std::string fullname = FMT::format("{}:{}/{}", hostname, port, name);
+                                             const std::string &address,
+                                             const std::string &port,
+                                             int interface) {
+  std::string fullname = FMT::format("{}:{}/{}", address, port, name);
 
-  if (!check_if_add_peer(name, hostname, port)) {
+  if (!check_if_add_peer(name, address, port)) {
     INFO("Not adding peer=\"{}\", as "
          "requested by settings",
          fullname);
     return;
   }
-  INFO("Discover peer=\"{}\"", fullname);
+  INFO("Discover peer=\"{}\" on interface {}", fullname, interface);
 
   for (auto &peer : peers) {
     if (peer.name == name) {
       local_alsa_listener_t *alsawaiter =
           dynamic_cast<local_alsa_listener_t *>(peer.alsawaiter.get());
+      // N3: one endpoint per interface, replaced when the service moves.
       if (alsawaiter)
-        alsawaiter->add_endpoint(hostname, port);
+        alsawaiter->add_endpoint(address, port, interface);
       DEBUG("Reuse peer=\"{}\"", fullname);
       return;
     }
   }
 
   DEBUG("New peer=\"{}\"", fullname);
-  auto peer = rtpmididns::make_local_alsa_listener(router, name, hostname, port,
-                                                   aseq, "0");
+  std::shared_ptr<midipeer_t> peer;
+  try {
+    peer = rtpmididns::make_local_alsa_listener(router, name, address, port,
+                                                aseq, "0", interface);
+  } catch (const std::exception &exc) {
+    // M2: no port, no listener: that peer gets none.
+    ERROR("Discovered peer=\"{}\" gets no ALSA port: {}", fullname,
+          exc.what());
+    return;
+  }
+  if (router->add_peer(peer) == MIDIPEER_ID_INVALID)
+    return;
   peers.push_back(known_remote_peer_t{name, peer});
-
-  router->add_peer(peer);
 }
 
+// N3: the browser's REMOVE takes that interface's endpoint away; when no
+// discovered endpoint is left, the listener goes.
 void rtpmidi_remote_handler_t::remove_peer(const std::string &name,
-                                           const std::string &hostname,
-                                           const std::string &port) {
-  DEBUG("Remove peer: name=\"{}\" address={}:{}", name, hostname, port);
-  std::vector<known_remote_peer_t>::iterator I = peers.begin(),
-                                             endI = peers.end();
-  for (; I != endI; ++I) {
-    if (I->name == name) {
-      INFO("Remove remote peer {} / midipeer {}", I->name,
-           I->alsawaiter->peer_id);
-      router->remove_peer(I->alsawaiter->peer_id);
-      peers.erase(I);
+                                           const std::string &address,
+                                           const std::string &port,
+                                           int interface) {
+  DEBUG("Remove peer: name=\"{}\" address={}:{} interface={}", name, address,
+        port, interface);
+  for (auto I = peers.begin(); I != peers.end(); ++I) {
+    if (I->name != name)
+      continue;
+    local_alsa_listener_t *alsawaiter =
+        dynamic_cast<local_alsa_listener_t *>(I->alsawaiter.get());
+    if (alsawaiter && alsawaiter->remove_discovered_endpoint(interface) > 0) {
+      INFO("Remote peer {}: endpoint on interface {} removed, {} left", name,
+           interface, alsawaiter->discovered_endpoints());
       return;
     }
+    INFO("Remove remote peer {} / midipeer {}", I->name,
+         I->alsawaiter->peer_id);
+    router->remove_peer(I->alsawaiter->peer_id);
+    peers.erase(I);
+    return;
   }
 }
 
