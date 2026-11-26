@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "../tests/test_case.hpp"
@@ -85,17 +87,21 @@ void test_several_connect_to_server() {
     ASSERT_TRUE(peer.peer->is_connected());
   }
 
+  // The second session's goodbyes come from its own sockets: a server takes a
+  // goodbye only from the port of the session it ends (1amfwm7fgu7, V1). This
+  // test sent them from the first client's sockets, which a fixed server
+  // ignores.
   INFO("Send disconnect");
-  control_client.send(disconnect_msg2);
+  control_client2.send(disconnect_msg2);
   DEBUG("{} peers", server.peers.size());
   ASSERT_EQUAL(server.peers.size(), 2);
-  midi_client.send(disconnect_msg2);
+  midi_client2.send(disconnect_msg2);
   DEBUG("{} peers", server.peers.size());
   ASSERT_EQUAL(server.peers.size(), 1);
 
   // Should do nothing, no add, no remove
-  midi_client.send(disconnect_msg2); // This may provoke a warning, but can be
-                                     // sent by remote side
+  midi_client2.send(disconnect_msg2); // This may provoke a warning, but can be
+                                      // sent by remote side
 
   DEBUG("{} {} {}", (void *)&server, server.peers.size(), server.peers.size());
   ASSERT_EQUAL(server.peers.size(), 1);
