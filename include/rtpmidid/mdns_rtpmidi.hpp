@@ -15,13 +15,17 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #pragma once
 
 #include "rtpmidid/poller.hpp"
 #include "rtpmidid/utils.hpp"
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -32,6 +36,7 @@ typedef struct AvahiClient AvahiClient;
 typedef struct AvahiPoll AvahiPoll;
 typedef struct AvahiEntryGroup AvahiEntryGroup;
 typedef struct AvahiServiceBrowser AvahiServiceBrowser;
+typedef struct AvahiServiceResolver AvahiServiceResolver;
 
 namespace rtpmidid {
 struct resolve_callback_s;
@@ -45,8 +50,9 @@ struct announcement_t {
 };
 struct remote_announcement_t {
   std::string name;
-  std::string address;
+  std::string address; // N1: the IPv4 address avahi resolved, as text
   int port;
+  int interface = -1; // the kernel's interface index it was seen on
 };
 
 class mdns_rtpmidi_t {
@@ -58,11 +64,18 @@ public:
   AvahiServiceBrowser *service_browser = nullptr;
   std::vector<announcement_t> announcements;
   std::vector<remote_announcement_t> remote_announcements;
-  // name, address, port
-  signal_t<const std::string &, const std::string &, const std::string &>
+  // N1: name, address (IPv4, as text), port, interface index. Fired when a
+  // service is found on an interface and again when its address or port
+  // there changes (N2).
+  signal_t<const std::string &, const std::string &, const std::string &, int>
       discover_event;
-  signal_t<const std::string &, const std::string &, const std::string &>
+  // name, address, port, interface index: the service is gone from that
+  // interface (the browser's REMOVE, the only removal: N2).
+  signal_t<const std::string &, const std::string &, const std::string &, int>
       remove_event;
+  // N2: one resolver per (service, interface), kept while the service exists.
+  std::map<std::string, AvahiServiceResolver *> resolvers;
+  std::set<std::string> failed_resolvers; // failed, no fresh address since
   poller_t::listener_t watch_in_poller;
   poller_t::listener_t watch_out_poller;
   poller_t::timer_t reconnect_timer;
@@ -87,7 +100,10 @@ public:
   void unannounce_rtpmidi(const std::string &name, const int32_t port);
 
   void discovered_remote(const remote_announcement_t &remote);
-  void removed_remote(const std::string &name);
+  void removed_remote(const std::string &name, int interface);
+  static std::string resolver_key(const std::string &name,
+                                  const std::string &type,
+                                  const std::string &domain, int interface);
 
   // Can be a local or remote (address="" for local)
   void remove_announcement(const std::string &name, const std::string &address,

@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "rtpmidiremotehandler.hpp"
@@ -33,13 +35,17 @@ rtpmidi_remote_handler_t::rtpmidi_remote_handler_t(
     std::shared_ptr<midirouter_t> router_, std::shared_ptr<aseq_t> aseq_)
     : router(router_), aseq(aseq_) {
 
+  // N1: the library hands on the address avahi resolved (and the interface,
+  // used by N3), never the host name.
   discover_connection = rtpmididns::mdns->discover_event.connect(
-      [this](const std::string &name, const std::string &hostname,
-             const std::string &port) { discover_peer(name, hostname, port); });
+      [this](const std::string &name, const std::string &address,
+             const std::string &port,
+             int) { discover_peer(name, address, port); });
 
   remove_connection = rtpmididns::mdns->remove_event.connect(
-      [this](const std::string &name, const std::string &hostname,
-             const std::string &port) { remove_peer(name, hostname, port); });
+      [this](const std::string &name, const std::string &address,
+             const std::string &port,
+             int) { remove_peer(name, address, port); });
 }
 
 void rtpmidi_remote_handler_t::discover_peer(const std::string &name,

@@ -15,6 +15,8 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include <avahi-common/address.h>
@@ -290,8 +292,9 @@ static void resolve_callback(AvahiServiceResolver *r, AvahiIfIndex interface,
   // NOLINTNEXTLINE
   rtpmidid::mdns_rtpmidi_t *mr = (rtpmidid::mdns_rtpmidi_t *)userdata;
 
+  // N2: the resolver is kept while its service exists, so that avahi reports
+  // a changed address; the browser's REMOVE frees it.
   mr->resolve_callback(data);
-  avahi_service_resolver_free(r);
 }
 
 struct rtpmidid::browse_callback_s {
@@ -330,8 +333,10 @@ rtpmidid::mdns_rtpmidi_t::mdns_rtpmidi_t() {
 void rtpmidid::mdns_rtpmidi_t::setup_service_browser() {
   if (service_browser)
     return;
+  // N1: IPv4 only. CUEMS runs avahi with use-ipv6=no, and an IPv6 address
+  // without its interface could not be used anyway.
   service_browser = avahi_service_browser_new(
-      client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, RTPMIDI_MDNS_SERVICE_NAME,
+      client, AVAHI_IF_UNSPEC, AVAHI_PROTO_INET, RTPMIDI_MDNS_SERVICE_NAME,
       NULL, (AvahiLookupFlags)0, ::browse_callback, this);
   if (!service_browser) {
     ERROR("Failed to create service browser: {}",
@@ -393,6 +398,10 @@ void rtpmidid::mdns_rtpmidi_t::close_avahi() {
     avahi_service_browser_free(service_browser);
     service_browser = nullptr;
   }
+  // The kept resolvers go with their client (avahi_client_free frees them);
+  // the new browser's events make them again. The endpoints stay meanwhile.
+  resolvers.clear();
+  failed_resolvers.clear();
   if (client) {
     avahi_client_free(client);
     client = nullptr;
@@ -460,42 +469,56 @@ void rtpmidid::mdns_rtpmidi_t::client_callback(avahi_client_state_e state_) {
   }
 }
 
+std::string rtpmidid::mdns_rtpmidi_t::resolver_key(const std::string &name,
+                                                   const std::string &type,
+                                                   const std::string &domain,
+                                                   int interface) {
+  return FMT::format("{}\x1f{}\x1f{}\x1f{}", name, type, domain, interface);
+}
+
 void rtpmidid::mdns_rtpmidi_t::resolve_callback(
     const resolve_callback_s &data) {
-  /* Called whenever a service has been resolved successfully or timed out */
+  /* Called whenever a service has been resolved, or the resolver failed */
+  const auto key = resolver_key(data.name, data.type ? data.type : "",
+                                data.domain ? data.domain : "",
+                                (int)data.interface);
   switch (data.event) {
   case AVAHI_RESOLVER_FAILURE: {
-    [[maybe_unused]] auto avahi_errno = avahi_client_errno(client);
-    [[maybe_unused]]const char *errmsg = avahi_strerror(avahi_errno);
-    ERROR("AVAHI_RESOLVER_FAILURE Failed to resolve service=\"{}\" of type={}"
-          "in domain={} host_name={} port={} with error_n={} error=\"{}\" ",
-          data.name, data.type, data.domain,
-          data.host_name == nullptr ? "null" : data.host_name, data.port,
-          avahi_errno, errmsg);
-
-    // We remove if it existed before. A resolver failure may be a timeout.
-    remove_event(data.name, std::to_string(data.host_name || ""),
-                 std::to_string(data.port));
+    // N2: no fresh address, nothing more. The peer is not removed (the
+    // browser's REMOVE does that): a resolver fails when a host record
+    // expires, which is also what a peer that only stopped answering does.
+    if (failed_resolvers.insert(key).second) {
+      [[maybe_unused]] auto avahi_errno = avahi_client_errno(client);
+      WARNING("Could not resolve service=\"{}\" on interface {}: {}. Its last "
+              "address is kept.",
+              data.name, (int)data.interface, avahi_strerror(avahi_errno));
+    }
   } break;
   case AVAHI_RESOLVER_FOUND: {
+    failed_resolvers.erase(key);
     if (!!(data.flags & AVAHI_LOOKUP_RESULT_OUR_OWN)) {
       DEBUG("Received own announcement of service={}. Ignore.", data.name);
+      return;
+    }
+    if (!data.address || data.address->proto != AVAHI_PROTO_INET) {
+      DEBUG("Service={} resolved to a non-IPv4 address. Ignore.", data.name);
       return;
     }
     std::array<char, AVAHI_ADDRESS_STR_MAX> avahi_address_str{};
     avahi_address_snprint(avahi_address_str.data(), avahi_address_str.size(),
                           data.address);
-    DEBUG("Discovered service=\"{}\" in host={}:{} ip={} flags={:04X}",
-          data.name, data.host_name, data.port, avahi_address_str.data(),
-          (int)data.flags);
+    DEBUG("Discovered service=\"{}\" in host={}:{} ip={} interface={} "
+          "flags={:04X}",
+          data.name, data.host_name ? data.host_name : "?", data.port,
+          avahi_address_str.data(), (int)data.interface, (int)data.flags);
 
-    // FIXME: address is not correct for interface (!), so is not unique, how to
-    // make unique? or filter on interface?
+    // N1: the peer is reached at the address avahi resolved, on the interface
+    // it was seen on; its host name is never looked up again.
     discovered_remote(rtpmidid::remote_announcement_t{
         data.name,
-        data.host_name,
-        // avahi_address_str.data(),
+        avahi_address_str.data(),
         data.port,
+        (int)data.interface,
     });
   }
   }
@@ -507,25 +530,45 @@ void rtpmidid::mdns_rtpmidi_t::browse_callback(const browse_callback_s &data) {
     ERROR("AVAHI_BROWSER_FAILURE {}",
           avahi_strerror(avahi_client_errno(client)));
     return;
-  case AVAHI_BROWSER_NEW:
-    if (!(avahi_service_resolver_new(client, data.interface, data.protocol,
-                                     data.name, data.type, data.domain,
-                                     AVAHI_PROTO_UNSPEC, (AvahiLookupFlags)0,
-                                     ::resolve_callback, (void *)this))) {
+  case AVAHI_BROWSER_NEW: {
+    const auto key =
+        resolver_key(data.name, data.type, data.domain, (int)data.interface);
+    if (resolvers.count(key)) {
+      DEBUG("Service '{}' on interface {} already has its resolver", data.name,
+            (int)data.interface);
+      break;
+    }
+    auto *resolver = avahi_service_resolver_new(
+        client, data.interface, data.protocol, data.name, data.type,
+        data.domain, AVAHI_PROTO_INET, (AvahiLookupFlags)0, ::resolve_callback,
+        (void *)this);
+    if (!resolver) {
       ERROR("AVAHI_BROWSER_NEW Failed to resolve service '{}': {}", data.name,
             avahi_strerror(avahi_client_errno(client)));
+      break;
     }
-    break;
-  case AVAHI_BROWSER_REMOVE:
+    resolvers[key] = resolver;
+  } break;
+  case AVAHI_BROWSER_REMOVE: {
     INFO("{} REMOVE: service=\"{}\" of type=\"{}\" in domain={} "
-         "flags={:08X} ",
-         data.event, data.name, data.type, data.domain, (int)data.flags);
+         "interface={} flags={:08X} ",
+         data.event, data.name, data.type, data.domain, (int)data.interface,
+         (int)data.flags);
+    // N2: the only removal. Its resolver goes with it.
+    const auto key =
+        resolver_key(data.name, data.type, data.domain, (int)data.interface);
+    auto resolver = resolvers.find(key);
+    if (resolver != resolvers.end()) {
+      avahi_service_resolver_free(resolver->second);
+      resolvers.erase(resolver);
+    }
+    failed_resolvers.erase(key);
     if (data.flags & AVAHI_LOOKUP_RESULT_OUR_OWN) {
       DEBUG("Received own announcement removal. Ignore.");
       return;
     }
-    removed_remote(data.name);
-    break;
+    removed_remote(data.name, (int)data.interface);
+  } break;
   case AVAHI_BROWSER_ALL_FOR_NOW:
   case AVAHI_BROWSER_CACHE_EXHAUSTED:
     INFO("{}", data.event);
@@ -654,18 +697,35 @@ void rtpmidid::mdns_rtpmidi_t::unannounce_rtpmidi(const std::string &name,
   announce_all();
 }
 
+// One entry per (service, interface). A report with the address and port the
+// entry already has is not news (a kept resolver reports again on refresh).
 void rtpmidid::mdns_rtpmidi_t::discovered_remote(
     const remote_announcement_t &remote) {
-  discover_event(remote.name, remote.address, std::to_string(remote.port));
+  for (auto &known : remote_announcements) {
+    if (known.name == remote.name && known.interface == remote.interface) {
+      if (known.address == remote.address && known.port == remote.port)
+        return;
+      INFO("Service=\"{}\" on interface {} moved: {}:{} -> {}:{}", remote.name,
+           remote.interface, known.address, known.port, remote.address,
+           remote.port);
+      known.address = remote.address;
+      known.port = remote.port;
+      discover_event(remote.name, remote.address, std::to_string(remote.port),
+                     remote.interface);
+      return;
+    }
+  }
   remote_announcements.push_back(remote);
+  discover_event(remote.name, remote.address, std::to_string(remote.port),
+                 remote.interface);
 }
 
-void rtpmidid::mdns_rtpmidi_t::removed_remote(const std::string &name) {
+void rtpmidid::mdns_rtpmidi_t::removed_remote(const std::string &name,
+                                              int interface) {
   // We copy as remove modifies the original
   auto remote_annoucements_copy{this->remote_announcements};
   for (auto remote : remote_annoucements_copy) {
-    if (remote.name == name) {
-      remove_event(name, remote.address, std::to_string(remote.port));
+    if (remote.name == name && remote.interface == interface) {
       remove_announcement(name, remote.address, remote.port);
     }
   }
@@ -676,12 +736,19 @@ void rtpmidid::mdns_rtpmidi_t::remove_announcement(const std::string &name,
                                                    int port) {
   if (address == "") {
     unannounce_rtpmidi(name, port);
-  } else {
-    remote_announcements.erase(
-        std::remove_if(
-            remote_announcements.begin(), remote_announcements.end(),
-            [name](const remote_announcement_t &t) { return name == t.name; }),
-        remote_announcements.end());
-    remove_event(name, address, std::to_string(port));
+    return;
   }
+  int interface = -1;
+  for (auto &remote : remote_announcements)
+    if (remote.name == name && remote.address == address &&
+        remote.port == port)
+      interface = remote.interface;
+  remote_announcements.erase(
+      std::remove_if(remote_announcements.begin(), remote_announcements.end(),
+                     [&](const remote_announcement_t &t) {
+                       return name == t.name && address == t.address &&
+                              port == t.port;
+                     }),
+      remote_announcements.end());
+  remove_event(name, address, std::to_string(port), interface);
 }

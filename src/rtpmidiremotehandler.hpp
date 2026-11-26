@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #pragma once
@@ -38,10 +40,10 @@ public:
   };
 
   rtpmidid::connection_t<const std::string &, const std::string &,
-                         const std::string &>
+                         const std::string &, int>
       discover_connection;
   rtpmidid::connection_t<const std::string &, const std::string &,
-                         const std::string &>
+                         const std::string &, int>
       remove_connection;
 
   std::shared_ptr<midirouter_t> router;
