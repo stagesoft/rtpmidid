@@ -43,7 +43,7 @@ static uint32_t read_u32(const uint8_t *bytes) {
 // when control + 1 is taken, as the client does; a fixed one is tried once.
 bool rtpserver_t::bind(const std::string &port) {
   static constexpr int MAX_PAIR_RETRIES = 5;
-  const bool dynamic = port == "0";
+  const bool dynamic = port == "0" || port.empty(); // an export asks for ""
   const int attempts = dynamic ? MAX_PAIR_RETRIES : 1;
   std::string error;
   for (int attempt = 0; attempt < attempts; attempt++) {
