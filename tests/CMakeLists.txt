@@ -17,7 +17,7 @@ add_test(NAME test_poller COMMAND test_poller)
 add_executable(test_misc test_misc.cpp test_utils.cpp)
 target_link_libraries(test_misc rtpmidid-shared -pthread)
 target_link_libraries(test_misc ${FMT_LIBRARIES})
-add_test(NAME test_misc COMMAND test_poller)
+add_test(NAME test_misc COMMAND test_misc)
 
 # add_executable(test_rtpmidid
 #     test_rtpmidid.cpp test_utils.cpp
@@ -87,14 +87,15 @@ endif (NOT LIBS_ONLY)
 
 # SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
 #
-# SESSION RECOVERY (1amfwm7fgu7). Built here, NOT registered with ctest yet:
-# five of its tests fail until the fix lands, and `make test` must stay green.
+# SESSION RECOVERY (1amfwm7fgu7). Registered with ctest now that the fix has
+# landed. The long run with the built-in timers is opt-in (RTPM_SOAK_SECONDS).
 #
 add_executable(test_session_recovery
     test_session_recovery.cpp test_utils.cpp
 )
 target_link_libraries(test_session_recovery -pthread rtpmidid-shared)
 target_link_libraries(test_session_recovery ${FMT_LIBRARIES})
+add_test(NAME test_session_recovery COMMAND test_session_recovery)
 
 if (NOT LIBS_ONLY)
     add_executable(test_rtpclient

@@ -1539,6 +1539,371 @@ void soak_two_clients_one_timeout_each() {
   soak.verdict();
 }
 
+// ------------------------------------------------------- fix-only tests
+//
+// AC2 (b): they need what the fix adds (tick and tries, the lookup hook and
+// count, replace_server_addresses, rtpserver_t::is_open) and claim nothing
+// about the unfixed library.
+
+// A repeating timer of the test's own: how often the loop turned while the
+// client was failing. A loop stalled by the client would starve it.
+struct loop_ticker_t {
+  int ticks = 0;
+  rtpmidid::poller_t::timer_t timer;
+  void arm() {
+    timer = rtpmidid::poller.add_timer_event(100ms, [this] { on_tick(); });
+  }
+  void on_tick() {
+    ticks++;
+    arm();
+  }
+  loop_ticker_t() { arm(); }
+};
+
+// Tries made by a client: every IN and CK0 it puts on the wire, sent or not.
+struct try_tap_t {
+  int invitations = 0;
+  int ck0 = 0;
+  std::vector<std::chrono::steady_clock::time_point> times;
+  rtppeer_t::send_event_t::connection_t connection;
+  explicit try_tap_t(rtpclient_t &client) {
+    connection = client.peer.send_event.connect(
+        [this](const rtpmidid::io_bytes_reader &data, rtppeer_t::port_e) {
+          const uint8_t *bytes = data.start;
+          if (data.size() < 4 || bytes[0] != 0xFF || bytes[1] != 0xFF)
+            return;
+          if (bytes[2] == 'I' && bytes[3] == 'N')
+            invitations++;
+          else if (bytes[2] == 'C' && bytes[3] == 'K' && bytes[8] == 0)
+            ck0++;
+          else
+            return;
+          times.push_back(std::chrono::steady_clock::now());
+        });
+  }
+  long min_gap_ms() const {
+    long gap = LONG_MAX;
+    for (size_t i = 1; i < times.size(); i++)
+      gap = std::min(gap, long(std::chrono::duration_cast<
+                                   std::chrono::milliseconds>(times[i] -
+                                                              times[i - 1])
+                                   .count()));
+    return gap;
+  }
+};
+
+// The once-a-minute line, with its minute shortened to `period`: how many
+// times it was written while watching for `time`.
+static int still_no_session_lines(rtpclient_t &client,
+                                  std::chrono::milliseconds time) {
+  int lines = 0;
+  auto last = client.last_still_no_session;
+  run_until(
+      [&] {
+        if (client.last_still_no_session != last) {
+          last = client.last_still_no_session;
+          lines++;
+        }
+        return false;
+      },
+      time);
+  return lines;
+}
+
+// A failure that does not wait must still cost one try a second at most, keep
+// the loop turning, and write one line per (shortened) minute.
+static void judge_failing_client(rtpclient_t &client, const char *what) {
+  client.still_no_session_period = 2000ms;
+  try_tap_t tries(client);
+  loop_ticker_t ticker;
+  const int lines = still_no_session_lines(client, 6500ms);
+  INFO("{}: {} invitations in 6.5 s, closest two {} ms apart; the loop ticked "
+       "{} times of 65; 'Still no session' lines: {} (period 2 s); last error: "
+       "{}",
+       what, tries.invitations, tries.min_gap_ms(), ticker.ticks, lines,
+       client.last_error);
+  ASSERT_LTE(tries.invitations, 8);
+  if (tries.invitations > 1)
+    ASSERT_GTE(tries.min_gap_ms(), 900L);
+  ASSERT_GTE(ticker.ticks, 55);
+  ASSERT_LTE(lines, 4);
+  ASSERT_FALSE(client.last_error.empty());
+}
+
+void a_name_with_no_answer_costs_one_try_a_second_at_most() {
+  rtpclient_t node("node");
+  int lookups = 0;
+  node.lookup_name = [&](const std::string &name, const std::string &,
+                         std::string &error) {
+    lookups++;
+    error = "lookup of " + name + " failed: no answer";
+    return std::vector<std::string>{};
+  };
+  node.add_server_address("controller.invalid", "5004");
+  judge_failing_client(node, "a name with no answer");
+  // and the name is looked up once in those 6.5 s (no sooner than 40 s, C6)
+  ASSERT_EQUAL(lookups, 1);
+}
+
+// Sending to the broadcast address without SO_BROADCAST: the kernel refuses
+// every sendto (EACCES), the way an output firewall rule does.
+void a_destination_the_kernel_refuses_costs_one_try_a_second_at_most() {
+  rtpclient_t node("node");
+  node.add_server_address("255.255.255.255", "5004");
+  judge_failing_client(node, "a destination refused at sendto");
+}
+
+void a_local_port_that_cannot_be_bound_costs_one_try_a_second_at_most() {
+  const int port = free_port_pair();
+  rtpmidid::udppeer_t holder("::", std::to_string(port)); // takes it
+  ASSERT_TRUE(holder.is_open());
+  fake_server_t server;
+  rtpclient_t node("node");
+  node.local_base_port_str = std::to_string(port);
+  node.add_server_address("127.0.0.1", std::to_string(server.port()));
+  judge_failing_client(node, "a local port that cannot be bound");
+  ASSERT_EQUAL(server.invitations, 0);
+}
+
+// Of two endpoints, the first refuses every send: it is left after one second
+// and the second one is reached.
+void an_endpoint_whose_send_fails_is_left_after_one_second() {
+  fake_server_t server;
+  rtpclient_t node("node");
+  fast_timeouts(node);
+  node.add_server_addresses({{"255.255.255.255", "5004"},
+                             {"127.0.0.1", std::to_string(server.port())}});
+  const auto start = std::chrono::steady_clock::now();
+  const bool up = run_until([&] { return is_up(node); }, 4000ms);
+  const long took = long(std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count());
+  INFO("up through the second endpoint: {} after {} ms", up, took);
+  ASSERT_TRUE(up);
+  ASSERT_LTE(took, 2500L);
+}
+
+void the_first_midi_invitation_leaves_with_the_control_ok() {
+  fake_server_t server;
+  rtpclient_t node("node");
+  fast_timeouts(node);
+  node.add_server_address("127.0.0.1", std::to_string(server.port()));
+  ASSERT_TRUE(run_until([&] { return is_up(node); }, 2000ms));
+  ASSERT_GTE(server.seen.size(), size_t(2));
+  const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       server.seen[1].when - server.seen[0].when)
+                       .count();
+  INFO("control IN to MIDI IN: {} ms", gap);
+  ASSERT_FALSE(server.seen[1].control);
+  ASSERT_LT(gap, 300);
+}
+
+// C6: a client given addresses makes no name lookup, through a connection, a
+// clock-sync verdict and a reconnection.
+void a_client_given_addresses_looks_no_name_up() {
+  fake_server_t server;
+  rtpclient_t node("node");
+  fast_timeouts(node);
+  int hook_lookups = 0;
+  node.lookup_name = [&](const std::string &, const std::string &,
+                         std::string &) {
+    hook_lookups++;
+    return std::vector<std::string>{};
+  };
+  const unsigned before = rtpmidid::network_address_list_t::name_lookups();
+  connect_to_fake(node, server);
+  one_ck_timeout(node);
+  ASSERT_TRUE(run_until([&] { return is_up(node); }, 5000ms));
+  const unsigned after = rtpmidid::network_address_list_t::name_lookups();
+  INFO("name lookups: {} by getaddrinfo, {} through the hook", after - before,
+       hook_lookups);
+  ASSERT_EQUAL(after - before, 0u);
+  ASSERT_EQUAL(hook_lookups, 0);
+}
+
+// C6: a name is looked up when the client starts, and again only after every
+// address of its answer failed and 40 s have passed. With the built-in 40 s:
+// one lookup in 15 s of failing attempts.
+void a_name_is_looked_up_no_sooner_than_40_s_after_the_last() {
+  fake_server_t server;
+  server.ignore_invitations = INT_MAX;
+  rtpclient_t node("node");
+  int lookups = 0;
+  node.lookup_name = [&](const std::string &, const std::string &,
+                         std::string &) {
+    lookups++;
+    return std::vector<std::string>{"127.0.0.1"};
+  };
+  node.add_server_address("controller.test", std::to_string(server.port()));
+  run_for(15000ms);
+  INFO("lookups in 15 s: {}; invitations the server saw: {}", lookups,
+       server.control_invitations);
+  ASSERT_EQUAL(lookups, 1);
+  ASSERT_GTE(server.control_invitations, 12);
+}
+
+// C6: a lookup that fails keeps the last good answer: the client goes on
+// inviting the address it had. The interval is shortened to 2 s here.
+void a_failed_lookup_keeps_the_last_good_answer() {
+  fake_server_t server;
+  server.ignore_invitations = INT_MAX;
+  rtpclient_t node("node");
+  node.name_lookup_interval = 2000ms;
+  node.control_tries = 2; // an attempt fails after 2 s, so lookups come due
+  int lookups = 0;
+  node.lookup_name = [&](const std::string &name, const std::string &,
+                         std::string &error) {
+    lookups++;
+    if (lookups == 1)
+      return std::vector<std::string>{"127.0.0.1"};
+    error = "lookup of " + name + " failed: no answer";
+    return std::vector<std::string>{};
+  };
+  node.add_server_address("controller.test", std::to_string(server.port()));
+  ASSERT_TRUE(run_until([&] { return lookups >= 2; }, 8000ms));
+  const int invitations = server.control_invitations;
+  run_for(3000ms);
+  INFO("lookups {}; invitations after the failed lookup: {}", lookups,
+       server.control_invitations - invitations);
+  ASSERT_GTE(server.control_invitations - invitations, 2);
+}
+
+// A live client whose endpoint is replaced invites the new one at its next
+// attempt, and never the old one again.
+void a_replaced_endpoint_is_invited_at_the_next_attempt() {
+  fake_server_t old_server;
+  old_server.name = "old";
+  fake_server_t new_server;
+  new_server.name = "new";
+  rtpclient_t node("node");
+  fast_timeouts(node);
+  node.ck_short_period = 1000ms;
+  node.ck_long_period = 1000ms;
+  connect_to_fake(node, old_server);
+
+  node.replace_server_addresses({{"127.0.0.1", std::to_string(new_server.port())}});
+  old_server.ignore_ck_requests = INT_MAX;
+  old_server.ignore_invitations = INT_MAX;
+  const int old_invitations = old_server.control_invitations;
+  const bool moved = run_until(
+      [&] { return is_up(node) && node.peer.remote_name == "new"; }, 20000ms);
+  INFO("up on the new endpoint: {}; invitations to the old one after the "
+       "replacement: {}",
+       moved, old_server.control_invitations - old_invitations);
+  ASSERT_TRUE(moved);
+  ASSERT_EQUAL(old_server.control_invitations, old_invitations);
+}
+
+// D10: the clock sync goes unanswered while the server's MIDI still arrives
+// (a loss towards the server only): the session stays. When the MIDI stops
+// too, the verdict comes.
+void midi_from_the_server_postpones_the_clock_sync_verdict() {
+  fake_server_t server;
+  rtpclient_t node("node");
+  fast_timeouts(node);
+  node.ck_short_period = 500ms;
+  connect_to_fake(node, server);
+  server.ignore_ck_requests = INT_MAX;
+
+  bool send = true;
+  uint16_t seq = 0;
+  auto send_note = [&] {
+    std::vector<uint8_t> packet{0x80, 0x61, uint8_t(seq >> 8), uint8_t(seq)};
+    seq++;
+    put32(packet, 0);      // timestamp
+    put32(packet, 0xBEEF); // the server's SSRC (fake_server_t answers with it)
+    packet.insert(packet.end(), {0x03, 0x90, 0x3C, 0x7F});
+    server.midi.sendto(rtpmidid::packet_t(packet.data(), packet.size()),
+                       server.midi_from);
+  };
+  rtpmidid::poller_t::timer_t note_timer;
+  std::function<void()> arm = [&] {
+    note_timer = rtpmidid::poller.add_timer_event(200ms, [&] {
+      if (send)
+        send_note();
+      arm();
+    });
+  };
+  arm();
+
+  // A verdict and a reconnection to this server take milliseconds: counted
+  // from the status events, not by watching is_up().
+  int downs = 0;
+  auto on_status = node.peer.status_change_event.connect(
+      [&](rtppeer_t::status_e status) {
+        if (rtppeer_t::is_disconnected(status))
+          downs++;
+      });
+  run_for(15000ms);
+  INFO("clock sync unanswered for 15 s with MIDI arriving: sessions ended {}, "
+       "CK0 seen {}",
+       downs, server.ck_requests);
+  ASSERT_EQUAL(downs, 0);
+  ASSERT_TRUE(is_up(node));
+  ASSERT_GTE(server.ck_requests, 12);
+
+  send = false;
+  const bool ended = run_until([&] { return downs > 0; }, 14000ms);
+  INFO("MIDI stopped: the session ended within 14 s: {}", ended);
+  note_timer.disable();
+  ASSERT_TRUE(ended);
+}
+
+// D8: every attempt carries a new SSRC and a new token; the repetitions of one
+// attempt carry the same.
+void each_attempt_has_a_new_ssrc() {
+  fake_server_t server;
+  server.ignore_invitations = INT_MAX;
+  rtpclient_t node("node");
+  node.control_tries = 2; // an attempt every 2 s
+  node.add_server_address("127.0.0.1", std::to_string(server.port()));
+  ASSERT_TRUE(
+      run_until([&] { return server.control_invitations >= 6; }, 9000ms));
+  std::vector<std::pair<uint32_t, uint32_t>> attempts; // token, ssrc
+  for (auto &invitation : server.seen) {
+    if (!invitation.control)
+      continue;
+    if (!attempts.empty() && attempts.back().first == invitation.token) {
+      ASSERT_EQUAL(attempts.back().second, invitation.ssrc);
+      continue;
+    }
+    attempts.push_back({invitation.token, invitation.ssrc});
+  }
+  INFO("{} attempts in {} invitations", attempts.size(),
+       server.control_invitations);
+  ASSERT_GTE(attempts.size(), size_t(3));
+  for (size_t i = 1; i < attempts.size(); i++) {
+    ASSERT_NOT_EQUAL(attempts[i].second, attempts[i - 1].second);
+    ASSERT_NOT_EQUAL(attempts[i].first, attempts[i - 1].first);
+  }
+}
+
+// V6: a server checks both binds. A fixed port whose port + 1 is taken, or
+// that is itself taken, gives a server that is not open and says so (and the
+// daemon then announces nothing, step 4). A dynamic port gives an adjacent
+// pair. (Forcing the dynamic retry would need the kernel's next choice.)
+void a_server_that_cannot_bind_says_so() {
+  const int port = free_port_pair();
+  {
+    rtpmidid::udppeer_t holder("::", std::to_string(port + 1));
+    ASSERT_TRUE(holder.is_open());
+    rtpmidid::rtpserver_t server("server", std::to_string(port));
+    INFO("fixed port {} with {} taken: open={} port()={}", port, port + 1,
+         server.is_open(), server.port());
+    ASSERT_FALSE(server.is_open());
+    ASSERT_EQUAL(server.port(), 0);
+  }
+  {
+    rtpmidid::udppeer_t holder("::", std::to_string(port));
+    ASSERT_TRUE(holder.is_open());
+    rtpmidid::rtpserver_t server("server", std::to_string(port));
+    ASSERT_FALSE(server.is_open());
+  }
+  rtpmidid::rtpserver_t server("server", "0");
+  ASSERT_TRUE(server.is_open());
+  ASSERT_EQUAL(server.midi.get_address().port(), server.port() + 1);
+}
+
 int main(int argc, char **argv) {
   if (soak_seconds() > 0) {
     test_case_t soaks{
@@ -1579,6 +1944,19 @@ int main(int argc, char **argv) {
       TEST(a_replaced_session_fires_its_disconnect_status),
       TEST(a_midi_only_session_is_gone_after_5_s),
       TEST(a_session_still_expires_when_other_sessions_come_and_go),
+      // fix-only (AC2 b)
+      TEST(a_name_with_no_answer_costs_one_try_a_second_at_most),
+      TEST(a_destination_the_kernel_refuses_costs_one_try_a_second_at_most),
+      TEST(a_local_port_that_cannot_be_bound_costs_one_try_a_second_at_most),
+      TEST(an_endpoint_whose_send_fails_is_left_after_one_second),
+      TEST(the_first_midi_invitation_leaves_with_the_control_ok),
+      TEST(a_client_given_addresses_looks_no_name_up),
+      TEST(a_name_is_looked_up_no_sooner_than_40_s_after_the_last),
+      TEST(a_failed_lookup_keeps_the_last_good_answer),
+      TEST(a_replaced_endpoint_is_invited_at_the_next_attempt),
+      TEST(midi_from_the_server_postpones_the_clock_sync_verdict),
+      TEST(each_attempt_has_a_new_ssrc),
+      TEST(a_server_that_cannot_bind_says_so),
   };
 
   testcase.run(argc, argv);
