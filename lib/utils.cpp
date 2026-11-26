@@ -15,6 +15,8 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include <random>
@@ -27,5 +29,12 @@ uint32_t rand_u32(void) {
   static std::uniform_int_distribution<uint32_t> distrib32;
 
   return distrib32(generator_mt19937);
+}
+
+uint32_t rand_u32_nonzero(void) {
+  uint32_t value = 0;
+  while (value == 0)
+    value = rand_u32();
+  return value;
 }
 } // namespace rtpmidid

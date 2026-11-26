@@ -15,6 +15,8 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include <rtpmidid/exceptions.hpp>
@@ -35,7 +37,7 @@ using namespace rtpmidid;
  *       expects next to be free. It almost always is, but can fail.
  */
 rtppeer_t::rtppeer_t(std::string _name)
-    : local_ssrc(::rtpmidid::rand_u32() & 0x0FFFF),
+    : local_ssrc(::rtpmidid::rand_u32_nonzero()),
       local_name(std::move(_name)), seq_nr(::rtpmidid::rand_u32() & 0x0FFFF) {
   timestamp_start = get_timestamp();
 
@@ -56,6 +58,14 @@ void rtppeer_t::reset() {
   remote_name = "";
   remote_ssrc = 0;
   initiator_id = 0;
+  waiting_ck = false;
+}
+
+void rtppeer_t::drop(status_e reason) {
+  auto self = weak_from_this().lock(); // the event may free the owner
+  status = NOT_CONNECTED;
+  waiting_ck = false;
+  status_change_event(reason);
 }
 
 void rtppeer_t::data_ready(io_bytes_reader &&buffer, port_e port) {
@@ -127,38 +137,35 @@ void rtppeer_t::parse_command(io_bytes_reader &buffer, port_e port) {
  * I already sent before the IN message, the server sent me OK
  */
 void rtppeer_t::parse_command_ok(io_bytes_reader &buffer, port_e port) {
-  if (status == CONNECTED) {
-    WARNING(
-        "This peer is already connected. Need to disconnect to connect again.");
-    return;
-  }
   auto protocol = buffer.read_uint32();
   auto initiator_id = buffer.read_uint32();
-  remote_ssrc = buffer.read_uint32();
-  remote_name = buffer.read_str0();
+  auto remote_ssrc = buffer.read_uint32();
+  auto remote_name = buffer.read_str0();
   if (protocol != 2) {
     throw exception(
         "rtpmidid only understands RTP MIDI protocol 2. Fill an issue at "
         "https://github.com/davidmoreno/rtpmidid/. Got protocol {}",
         protocol);
   }
+  // C3: an OK for another invitation (an earlier attempt's, late) or for a port
+  // already confirmed (the answer to a repeated IN) changes nothing.
   if (initiator_id != this->initiator_id) {
-    throw exception(
-        "Response to connect from an unknown initiator. Not connecting.");
+    DEBUG("Ignoring OK for initiator {:08X}, this invitation is {:08X}",
+          initiator_id, this->initiator_id);
+    return;
   }
-
-  INFO("Got confirmation from {}, initiator_id: {} ({}) ssrc: {}, "
-       "port: {}",
-       remote_name, initiator_id,
-       this->initiator_id == initiator_id ? "ok" : "nok", remote_ssrc, port);
-
-  if (port == MIDI_PORT) {
-    status = status_e(int(status) | int(MIDI_CONNECTED));
-  } else if (port == CONTROL_PORT) {
-    status = status_e(int(status) | int(CONTROL_CONNECTED));
-  } else {
-    ERROR("Got data on unknown PORT! {}", port);
+  const auto bit = port == MIDI_PORT ? MIDI_CONNECTED : CONTROL_CONNECTED;
+  if (int(status) & int(bit)) {
+    DEBUG("Ignoring repeated OK on the {} port", port);
+    return;
   }
+  this->remote_ssrc = remote_ssrc;
+  this->remote_name = remote_name;
+
+  INFO("Got confirmation from {}, initiator_id: {:08X} ssrc: {:08X}, port: {}",
+       this->remote_name, initiator_id, this->remote_ssrc, port);
+
+  status = status_e(int(status) | int(bit));
   DEBUG("New status is {}", status);
   status_change_event(status);
 }
@@ -172,14 +179,10 @@ void rtppeer_t::parse_command_ok(io_bytes_reader &buffer, port_e port) {
  * connected to me.
  */
 void rtppeer_t::parse_command_in(io_bytes_reader &buffer, port_e port) {
-  if (status == CONNECTED) {
-    WARNING("This peer is already connected. But OK, I will accept it anew. "
-            "Might happen on some split brain situations.");
-  }
   auto protocol = buffer.read_uint32();
-  initiator_id = buffer.read_uint32();
-  remote_ssrc = buffer.read_uint32();
-  remote_name = buffer.read_str0();
+  auto initiator_id = buffer.read_uint32();
+  auto remote_ssrc = buffer.read_uint32();
+  auto remote_name = buffer.read_str0();
 
   if (protocol != 2) {
     throw exception(
@@ -188,31 +191,43 @@ void rtppeer_t::parse_command_in(io_bytes_reader &buffer, port_e port) {
         protocol);
   }
 
-  INFO("Got connection request from remote_name=\"{}\", initiator_id={:X}  "
-       "ssrc={:X}, local_name=\"{}\", at port={}",
-       remote_name, initiator_id, remote_ssrc, remote_name, port);
+  // The server hands a session only its own invitations (V1, V2): an IN for a
+  // port this session already has is a repetition (its OK was lost). It is
+  // answered again, and nothing else changes: no state, no event (a CONNECTED
+  // event makes an ALSA port in the daemon, 1amfwm7h80b).
+  const auto bit = port == MIDI_PORT ? MIDI_CONNECTED : CONTROL_CONNECTED;
+  const bool repeated = (int(status) & int(bit)) != 0;
+  if (!repeated) {
+    this->initiator_id = initiator_id;
+    this->remote_ssrc = remote_ssrc;
+    this->remote_name = remote_name;
+    INFO("Got connection request from remote_name=\"{}\", initiator_id={:X}  "
+         "ssrc={:X}, local_name=\"{}\", at port={}",
+         this->remote_name, initiator_id, remote_ssrc, local_name, port);
+  } else {
+    DEBUG("Repeated invitation from \"{}\" on the {} port, answered again",
+          this->remote_name, port);
+  }
 
   io_bytes_writer_static<128> response;
   response.write_uint16(0xFFFF);
   response.write_uint16(OK);
   response.write_uint32(2);
-  response.write_uint32(initiator_id);
+  response.write_uint32(this->initiator_id);
   response.write_uint32(local_ssrc);
   response.write_str0(local_name);
 
   send_event(response, port);
 
-  if (port == MIDI_PORT)
-    status = status_e(int(status) | int(MIDI_CONNECTED));
-  if (port == CONTROL_PORT)
-    status = status_e(int(status) | int(CONTROL_CONNECTED));
-
+  if (repeated)
+    return;
+  status = status_e(int(status) | int(bit));
   status_change_event(status);
 }
 
 void rtppeer_t::parse_command_by(io_bytes_reader &buffer, port_e port) {
   auto protocol = buffer.read_uint32();
-  initiator_id = buffer.read_uint32();
+  auto initiator_id = buffer.read_uint32();
   auto remote_ssrc = buffer.read_uint32();
 
   if (protocol != 2) {
@@ -222,8 +237,13 @@ void rtppeer_t::parse_command_by(io_bytes_reader &buffer, port_e port) {
         protocol);
   }
 
-  if (remote_ssrc != this->remote_ssrc) {
-    WARNING("Trying to disconnect from the wrong rtpmidi peer (bad port)");
+  // V1: a goodbye is honoured only with the session's SSRC and token, and it
+  // never changes the token (it used to overwrite it, so that a late goodbye
+  // could leave a session answering for another's).
+  if (remote_ssrc != this->remote_ssrc || initiator_id != this->initiator_id) {
+    DEBUG("Ignoring goodbye for ssrc {:08X} token {:08X}; this session is "
+          "ssrc {:08X} token {:08X}",
+          remote_ssrc, initiator_id, this->remote_ssrc, this->initiator_id);
     return;
   }
 
@@ -249,7 +269,7 @@ void rtppeer_t::parse_command_by(io_bytes_reader &buffer, port_e port) {
 
 void rtppeer_t::parse_command_no(io_bytes_reader &buffer, port_e port) {
   auto protocol = buffer.read_uint32();
-  initiator_id = buffer.read_uint32();
+  auto initiator_id = buffer.read_uint32();
   [[maybe_unused]] auto remote_ssrc = buffer.read_uint32();
 
   if (protocol != 2) {
@@ -257,6 +277,11 @@ void rtppeer_t::parse_command_no(io_bytes_reader &buffer, port_e port) {
         "rtpmidid only understands RTP MIDI protocol 2. Fill an issue at "
         "https://github.com/davidmoreno/rtpmidid/. Got protocol {}",
         protocol);
+  }
+  if (initiator_id != this->initiator_id) {
+    DEBUG("Ignoring NO for initiator {:08X}, this invitation is {:08X}",
+          initiator_id, this->initiator_id);
+    return;
   }
 
   status = (status_e)(((int)status) &
@@ -288,6 +313,12 @@ void rtppeer_t::parse_command_ck(io_bytes_reader &buffer, port_e port) {
     count = 1;
   } break;
   case 1: {
+    // C3: a reply that arrives outside an exchange (after the verdict, or a
+    // second reply to a repeated CK0) changes nothing, and is not answered.
+    if (!waiting_ck) {
+      DEBUG("Ignoring a clock-sync reply outside an exchange");
+      return;
+    }
     // Send my timestamp. I will use it when get answer with 3.
     ck2 = buffer.read_uint64();
     ck3 = get_timestamp();
@@ -487,11 +518,13 @@ void rtppeer_t::parse_midi(io_bytes_reader &buffer) {
   buffer.read_uint32();                    // Ignore timestamp
   auto remote_ssrc = buffer.read_uint32(); // SSRC
   if (remote_ssrc != this->remote_ssrc) {
-    WARNING("Got message for unknown remote SSRC on this port. (from {:04X}, "
-            "I'm {:04X})",
-            remote_ssrc, this->remote_ssrc);
+    WARNING_RATE_LIMIT(60,
+                       "Got message for unknown remote SSRC on this port. "
+                       "(from {:08X}, I'm {:08X})",
+                       remote_ssrc, this->remote_ssrc);
     return;
   }
+  last_midi_at = std::chrono::steady_clock::now();
 
   // RFC 6295 RTP-MIDI _header
   // The Flags are:
@@ -652,7 +685,7 @@ uint64_t rtppeer_t::get_timestamp() {
 void rtppeer_t::send_midi(const io_bytes_reader &events) {
   if (!is_connected()) { // Not connected yet.
     WARNING_RATE_LIMIT(
-        10, "Can not send MIDI data to {} yet, not connected ({:X}).",
+        60, "Can not send MIDI data to {} yet, not connected ({:X}).",
         remote_name, (int)status);
     return;
   }

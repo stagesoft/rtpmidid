@@ -15,6 +15,8 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #pragma once
@@ -23,6 +25,7 @@
 #include "signal.hpp"
 #include "stats.hpp"
 #include <arpa/inet.h>
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -88,6 +91,9 @@ public:
   uint64_t timestamp_start = 0; // Time in ms
   uint64_t latency = 0;
   bool waiting_ck = false;
+  // When MIDI from the remote SSRC last arrived (D10: it postpones the
+  // client's clock-sync verdict). Default: never.
+  std::chrono::steady_clock::time_point last_midi_at{};
   uint8_t running_status = 0;
   // Need some buffer space for sysex. This may require memory alloc.
   std::vector<uint8_t> sysex;
@@ -130,6 +136,9 @@ public:
   bool is_disconnected() { return status & DISCONNECTED; }
   static bool is_disconnected(status_e st) { return st & DISCONNECTED; }
   void reset();
+  // The session is gone without a goodbye (a server replaces it, V2): no
+  // datagram is sent, the status event fires with `reason`.
+  void drop(status_e reason);
   void data_ready(io_bytes_reader &&, port_e port);
   void disconnect();
 
