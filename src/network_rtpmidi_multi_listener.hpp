@@ -14,11 +14,14 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #pragma once
 #include "midipeer.hpp"
 #include "rtpmidid/rtpserver.hpp"
+#include <map>
 #include <memory>
 #include <string>
 
@@ -39,12 +42,16 @@ public:
   rtpmidid::rtpserver_t::midi_event_t::connection_t midi_connection;
   rtpmidid::rtpserver_t::status_change_event_t::connection_t
       status_change_connection;
+  // M1: the sessions that have their ALSA port (router id of the port)
+  std::map<const rtpmidid::rtppeer_t *, midipeer_id_t> sessions;
 
   network_rtpmidi_multi_listener_t(const std::string &name,
                                    const std::string &port,
                                    std::shared_ptr<aseq_t> aseq);
   void send_midi(midipeer_id_t from, const mididata_t &) override;
   json_t status() override;
+  void session_status(std::shared_ptr<rtpmidid::rtppeer_t> peer,
+                      rtpmidid::rtppeer_t::status_e status);
   const char *get_type() const override {
     return "network_rtpmidi_multi_listener_t";
   }
