@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #pragma once
@@ -35,6 +37,7 @@ class udppeer_t {
 
 private:
   int fd = -1;
+  int last_errno = 0;
   poller_t::listener_t listener;
 
   void data_ready();
@@ -60,11 +63,13 @@ public:
       : udppeer_t(network_address_t::create_const(addr, socklen)){};
   udppeer_t(udppeer_t &&other) {
     fd = other.fd;
+    last_errno = other.last_errno;
     listener = std::move(other.listener);
     other.fd = -1;
   }
   void operator=(udppeer_t &&other) {
     fd = other.fd;
+    last_errno = other.last_errno;
     listener = std::move(other.listener);
     other.fd = -1;
   }
@@ -83,6 +88,8 @@ public:
   void close();
 
   bool is_open() const { return fd >= 0; }
+  // The errno of the last open or send that failed, 0 after a good open.
+  int get_errno() const { return last_errno; }
   network_address_t get_address();
 };
 

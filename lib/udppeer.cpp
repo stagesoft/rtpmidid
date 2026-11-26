@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "rtpmidid/udppeer.hpp"
@@ -41,17 +43,24 @@ int udppeer_t::open(const network_address_t &address) {
 
   fd = socket(address.get_aifamily(), SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
+  // No log line here: the caller knows how often it tries, and says what failed
+  // (last_errno) at its own rate.
   if (fd < 0) {
-    ERROR("Error creating socket: {}", strerror(errno));
+    last_errno = errno;
+    DEBUG("Error creating socket: {}", strerror(last_errno));
     return -1; // Bad socket, try next
   }
   auto ret = bind(fd, addr, addrlen);
   if (ret != 0) {
-    ERROR("Error binding socket: {} {}", address.to_string(), strerror(errno));
+    last_errno = errno;
+    DEBUG("Error binding socket: {} {}", address.to_string(),
+          strerror(last_errno));
     ::close(fd);
     fd = -1;
+    errno = last_errno;
     return -1;
   }
+  last_errno = 0;
 
   network_address_t myaddress{fd};
 
@@ -76,7 +85,8 @@ int udppeer_t::open(const network_address_list_t &address_list) {
       return fd;
     }
   }
-  ERROR("Could not open any address from list");
+  DEBUG("Could not open any address from list: {}", strerror(last_errno));
+  errno = last_errno;
   return -1;
 }
 
@@ -108,11 +118,12 @@ ssize_t udppeer_t::sendto(const packet_t &packet,
                       addr.get_sockaddr(), addr.get_socklen());
 
   if (res < 0) {
-    std::string addr_str = addr.to_string();
-    ERROR("Error sending to {}. This is UDP... so just lost! ({})", addr_str,
-          strerror(errno));
-    // throw rtpmidid::exception("Can not send to address {}. {}", addr_str,
-    //                           strerror(errno));
+    // Reported to the caller (the return value, errno and last_errno), which
+    // logs it at its own rate: one line per failed datagram flooded the
+    // journal while a peer was away.
+    last_errno = errno;
+    DEBUG("Error sending to {}: {}", addr.to_string(), strerror(last_errno));
+    errno = last_errno;
   }
 
   // DEBUG0("Sent to {} bytes", packet);

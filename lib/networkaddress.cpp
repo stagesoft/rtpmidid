@@ -14,8 +14,11 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
+#include <atomic>
 #include <cassert>
 #include <functional>
 #include <rtpmidid/exceptions.hpp>
@@ -141,6 +144,47 @@ bool network_address_t::resolve_loop(const std::string &address,
   return false;
 }
 
+// The address part of a socket address, with an IPv4-mapped IPv6 address taken
+// as the IPv4 address it maps: a dual-stack socket reports IPv4 peers that way.
+static bool address_bytes(const sockaddr *addr, int &family,
+                          const uint8_t *&bytes) {
+  if (!addr)
+    return false;
+  if (addr->sa_family == AF_INET) {
+    family = AF_INET;
+    bytes = reinterpret_cast<const uint8_t *>(
+        &reinterpret_cast<const sockaddr_in *>(addr)->sin_addr);
+    return true;
+  }
+  if (addr->sa_family == AF_INET6) {
+    const auto *in6 = &reinterpret_cast<const sockaddr_in6 *>(addr)->sin6_addr;
+    if (IN6_IS_ADDR_V4MAPPED(in6)) {
+      family = AF_INET;
+      bytes = reinterpret_cast<const uint8_t *>(in6) + 12;
+    } else {
+      family = AF_INET6;
+      bytes = reinterpret_cast<const uint8_t *>(in6);
+    }
+    return true;
+  }
+  return false;
+}
+
+bool network_address_t::same_host(const network_address_t &other) const {
+  int family_a = 0;
+  int family_b = 0;
+  const uint8_t *bytes_a = nullptr;
+  const uint8_t *bytes_b = nullptr;
+  if (!address_bytes(addr, family_a, bytes_a) ||
+      !address_bytes(other.addr, family_b, bytes_b) || family_a != family_b)
+    return false;
+  return memcmp(bytes_a, bytes_b, family_a == AF_INET ? 4 : 16) == 0;
+}
+
+bool network_address_t::same_endpoint(const network_address_t &other) const {
+  return same_host(other) && port() == other.port();
+}
+
 void network_address_t::set_port(int port) {
   if (!addr) {
     ERROR("This network address do not point to any address.");
@@ -159,6 +203,22 @@ void network_address_t::set_port(int port) {
 
 network_address_list_t::network_address_list_t() : info(nullptr) {}
 
+static std::atomic<unsigned> name_lookup_count{0};
+
+unsigned network_address_list_t::name_lookups() { return name_lookup_count; }
+
+bool network_address_list_t::is_numeric(const std::string &name) {
+  if (name.empty())
+    return false;
+  std::array<uint8_t, sizeof(in6_addr)> buffer{};
+  return inet_pton(AF_INET, name.c_str(), buffer.data()) == 1 ||
+         inet_pton(AF_INET6, name.c_str(), buffer.data()) == 1;
+}
+
+// A numeric address (or none, for a wildcard bind) is converted without any
+// lookup. Anything else is a name, looked up with the blocking getaddrinfo and
+// counted, so that a test can tell that no lookup was made. The caller reports
+// a failure (error()), as it decides how often to say so.
 network_address_list_t::network_address_list_t(const std::string &name,
                                                const std::string &port) {
   addrinfo hints{};
@@ -170,13 +230,25 @@ network_address_list_t::network_address_list_t(const std::string &name,
   hints.ai_addr = nullptr;
   hints.ai_next = nullptr;
 
-  if (getaddrinfo(name.c_str(), port.c_str(), &hints, &info) != 0) {
-    ERROR("Error getting address info for {}:{}", name, port);
+  const bool numeric = is_numeric(name);
+  if (numeric) {
+    hints.ai_flags |= AI_NUMERICHOST;
+  } else {
+    name_lookup_count++;
+  }
+  error = getaddrinfo(name.c_str(), port.c_str(), &hints, &info);
+  if (error != 0) {
+    DEBUG("Error getting address info for {}:{}: {}", name, port,
+          gai_strerror(error));
     if (info) {
       freeaddrinfo(info);
     }
     info = nullptr;
   }
+}
+
+std::string network_address_list_t::error_string() const {
+  return error == 0 ? std::string("no error") : std::string(gai_strerror(error));
 }
 
 network_address_list_t::~network_address_list_t() {
@@ -191,7 +263,9 @@ network_address_list_t::operator=(network_address_list_t &&other) {
     freeaddrinfo(info);
   }
   info = other.info;
+  error = other.error;
   other.info = nullptr;
+  other.error = 0;
   return *this;
 }
 

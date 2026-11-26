@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #pragma once
@@ -92,6 +94,11 @@ public:
 
   bool is_valid() const { return addr != nullptr; }
 
+  // Same address, port ignored; an IPv4-mapped IPv6 address equals its IPv4.
+  bool same_host(const network_address_t &other) const;
+  // Same address and port.
+  bool same_endpoint(const network_address_t &other) const;
+
   // resolve all the possible addresses for a given address and port, until
   // return true, return false if no address pass the loop successfully.
   static bool resolve_loop(const std::string &address, const std::string &port,
@@ -103,8 +110,14 @@ public:
 class network_address_list_t {
   NON_COPYABLE(network_address_list_t);
   addrinfo *info = nullptr;
+  int error = 0; // getaddrinfo's result, 0 when it found something
 
 public:
+  // Names looked up so far by this process (a numeric address is no lookup).
+  static unsigned name_lookups();
+  // An IPv4 or IPv6 address written in numbers.
+  static bool is_numeric(const std::string &name);
+
   network_address_list_t();
   network_address_list_t(const std::string &name, const std::string &port);
   ~network_address_list_t();
@@ -114,6 +127,8 @@ public:
   network_address_t get_first() const;
 
   bool is_valid() const { return info != nullptr; }
+  int get_error() const { return error; }
+  std::string error_string() const;
 
   class iterator_t {
     addrinfo *info = nullptr;
