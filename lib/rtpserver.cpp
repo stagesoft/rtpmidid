@@ -15,9 +15,12 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include <algorithm>
+#include <cstring>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -31,12 +34,45 @@
 
 using namespace rtpmidid;
 
+static uint32_t read_u32(const uint8_t *bytes) {
+  return (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) |
+         (uint32_t(bytes[2]) << 8) | uint32_t(bytes[3]);
+}
+
+// V6: both ports, MIDI on control + 1. A dynamic port ("0") tries a new pair
+// when control + 1 is taken, as the client does; a fixed one is tried once.
+bool rtpserver_t::bind(const std::string &port) {
+  static constexpr int MAX_PAIR_RETRIES = 5;
+  const bool dynamic = port == "0";
+  const int attempts = dynamic ? MAX_PAIR_RETRIES : 1;
+  std::string error;
+  for (int attempt = 0; attempt < attempts; attempt++) {
+    control.open("::", port);
+    if (!control.is_open()) {
+      error = FMT::format("control port {}: {}", port,
+                          strerror(control.get_errno()));
+      continue;
+    }
+    const int base = control.get_address().port();
+    midi.open("::", base + 1);
+    if (midi.is_open())
+      return true;
+    error =
+        FMT::format("MIDI port {}: {}", base + 1, strerror(midi.get_errno()));
+    control.close();
+  }
+  ERROR("RTP MIDI server '{}' could not bind its ports ({}); it is not "
+        "listening",
+        name, error);
+  return false;
+}
+
 // NOLINTNEXTLINE(bugprone-swappable-parameters)
 rtpserver_t::rtpserver_t(std::string _name, const std::string &port)
     : name(std::move(_name)) {
 
-  control.open("::", port);
-  midi.open("::", control.get_address().port() + 1);
+  if (!bind(port))
+    return;
 
   on_read_control = control.on_read.connect(
       [&](const packet_t &packet, const network_address_t &from) {
@@ -60,10 +96,9 @@ rtpserver_t::~rtpserver_t() {
   // Must clear here, to be able to use the control and midi
   // sockets
   // This calls indirectly all the disconnects, that will remove from the
-  // array, and create a segfault. So we create a shared_ptr copy and use that.
-  // I did try to be smarter, but the peers list can be modified when sending
-  // goodbyes, so better copy peers to be safe.
-  std::vector<std::shared_ptr<rtppeer_t>> peers_copy(peers.size());
+  // list. So we create a shared_ptr copy and use that.
+  std::vector<std::shared_ptr<rtppeer_t>> peers_copy;
+  peers_copy.reserve(peers.size());
   for (auto &peerinfo : peers) {
     DEBUG("Peer still in the server list: {}", peerinfo.id);
     peers_copy.push_back(peerinfo.peer);
@@ -81,64 +116,16 @@ rtpserver_t::~rtpserver_t() {
   }
 }
 
-rtpserverpeer_t *rtpserver_t::find_peer_by_packet(io_bytes_reader &buffer,
-                                                  rtppeer_t::port_e port) {
-  // Commands may be by SSRC or initiator_id
-  auto command =
-      rtppeer_t::commands_e((uint16_t(buffer.start[2]) << 8) + buffer.start[3]);
-
-  switch (command) {
-  case rtppeer_t::IN:
-  case rtppeer_t::OK:
-  case rtppeer_t::NO: {
-    buffer.position = buffer.start + 8;
-    auto initiator_id = buffer.read_uint32();
-    buffer.position = buffer.start;
-
-    return find_peer_by_initiator_id(initiator_id);
-  }
-  case rtppeer_t::BY: {
-    buffer.position = buffer.start + 12;
-    auto ssrc_id = buffer.read_uint32();
-    buffer.position = buffer.start;
-
-    return find_peer_by_ssrc(ssrc_id);
-  }
-  case rtppeer_t::CK:
-  case rtppeer_t::RS: {
-    buffer.position = buffer.start + 4;
-    auto ssrc = buffer.read_uint32();
-    buffer.position = buffer.start;
-    return find_peer_by_ssrc(ssrc);
-  }
-  default:
-    if (port == rtppeer_t::MIDI_PORT && (buffer.start[1] & 0x7F) == 0x61) {
-      buffer.read_uint32();
-      buffer.read_uint32();
-      auto ssrc = buffer.read_uint32();
-      buffer.position = buffer.start;
-
-      return find_peer_by_ssrc(ssrc);
-    }
-    DEBUG("Unknown COMMAND id {:X} / {:X}", int(command), buffer.start[1]);
-    return nullptr;
-  }
-}
-
-rtpserverpeer_t *rtpserver_t::find_peer_by_ssrc(uint32_t ssrc) {
-  for (auto &peerdata : peers) {
-    if (peerdata.peer->remote_ssrc == ssrc) {
-      return &peerdata;
-    }
-  }
-  return nullptr;
-}
-
-rtpserverpeer_t *rtpserver_t::find_peer_by_initiator_id(uint32_t initiator_id) {
-  for (auto &peerdata : peers) {
-    if (peerdata.peer->initiator_id == initiator_id) {
-      return &peerdata;
-    }
+// V1: a session is (source address, base port, SSRC); its control datagrams
+// come from the base port, its MIDI ones from base + 1.
+rtpserverpeer_t *rtpserver_t::find_session(const network_address_t &from,
+                                           rtppeer_t::port_e port,
+                                           uint32_t ssrc) {
+  const int base = from.port() - (port == rtppeer_t::MIDI_PORT ? 1 : 0);
+  for (auto &session : peers) {
+    if (session.base_port == base && session.peer->remote_ssrc == ssrc &&
+        session.address.same_host(from))
+      return &session;
   }
   return nullptr;
 }
@@ -147,36 +134,117 @@ void rtpserver_t::data_ready(const io_bytes_reader &data,
                              const network_address_t &addr,
                              rtppeer_t::port_e port) {
   io_bytes_reader buffer(data);
-  auto peer = find_peer_by_packet(buffer, port);
-  if (peer) {
-    peer->peer->data_ready(std::move(buffer), port);
-  } else {
-    if (rtppeer_t::is_command(buffer) && buffer.start[2] == 'I' &&
-        buffer.start[3] == 'N') {
-      create_peer_from(std::move(buffer), addr, port);
-    } else
-      DEBUG("Unknown peer {}, and not connect on control. Ignoring {} port.",
-            addr.to_string(), port);
+  const uint8_t *bytes = buffer.start;
+  const size_t size = buffer.size();
 
-    buffer.print_hex(true);
+  uint32_t ssrc = 0;
+  if (rtppeer_t::is_command(buffer)) {
+    const uint16_t command = (uint16_t(bytes[2]) << 8) | bytes[3];
+    switch (command) {
+    case rtppeer_t::IN:
+      invitation(buffer, addr, port);
+      return;
+    case rtppeer_t::OK:
+    case rtppeer_t::NO:
+    case rtppeer_t::BY:
+      ssrc = read_u32(bytes + 12);
+      break;
+    case rtppeer_t::CK:
+    case rtppeer_t::RS:
+      ssrc = read_u32(bytes + 4);
+      break;
+    default:
+      DEBUG("Unknown command {:04X} from {}, ignored", command,
+            addr.to_string());
+      return;
+    }
+  } else if (rtppeer_t::is_feedback(buffer)) {
+    ssrc = read_u32(bytes + 4);
+  } else if (port == rtppeer_t::MIDI_PORT && size >= 12 &&
+             (bytes[1] & 0x7F) == 0x61) {
+    ssrc = read_u32(bytes + 8);
+  } else {
+    DEBUG("Unknown datagram from {} on the {} port, ignored", addr.to_string(),
+          port);
+    return;
   }
+
+  auto *session = find_session(addr, port, ssrc);
+  if (!session) {
+    DEBUG("Datagram from {} on the {} port, ssrc {:08X}: no such session, "
+          "ignored",
+          addr.to_string(), port, ssrc);
+    return;
+  }
+  // The peer may end its session (a goodbye) and so free it: keep it alive.
+  auto peer = session->peer;
+  peer->data_ready(std::move(buffer), port);
+}
+
+// V2: a repetition, the other port of a handshake, a new session that replaces
+// a client's others, or a new client.
+void rtpserver_t::invitation(const io_bytes_reader &data,
+                             const network_address_t &from,
+                             rtppeer_t::port_e port) {
+  io_bytes_reader buffer(data);
+  const uint32_t token = read_u32(buffer.start + 8);
+  const uint32_t ssrc = read_u32(buffer.start + 12);
+  // V3: the base port is the source port of a control IN, the source port - 1
+  // of a MIDI IN that arrives first.
+  const int base = from.port() - (port == rtppeer_t::MIDI_PORT ? 1 : 0);
+
+  for (auto &session : peers) {
+    if (session.base_port == base && session.peer->remote_ssrc == ssrc &&
+        session.peer->initiator_id == token && session.address.same_host(from)) {
+      auto peer = session.peer;
+      peer->data_ready(std::move(buffer), port);
+      return;
+    }
+  }
+
+  if (port == rtppeer_t::CONTROL_PORT) {
+    // A control IN from a known client (same address, same SSRC) with another
+    // base port or token: its new session. The others go, with no goodbye to
+    // their dead ports; their disconnect status removes their ALSA ports.
+    std::vector<std::shared_ptr<rtppeer_t>> replaced;
+    for (auto &session : peers) {
+      if (session.peer->remote_ssrc == ssrc && session.address.same_host(from)) {
+        INFO("Session replaced: {} by a new invitation from port {}",
+             session.label(), base);
+        replaced.push_back(session.peer);
+      }
+    }
+    for (auto &peer : replaced)
+      peer->drop(rtppeer_t::DISCONNECTED_PEER_DISCONNECTED);
+  }
+  // A MIDI IN never removes anything: it opens an incomplete session that the
+  // control IN completes, or that goes after 5 s (V5).
+  create_session(std::move(buffer), from, base, port);
 }
 
 void rtpserver_t::sendto(const io_bytes_reader &pb, rtppeer_t::port_e port,
                          network_address_t &address, int remote_base_port) {
+  ssize_t res;
   if (port == rtppeer_t::MIDI_PORT) {
     address.set_port(remote_base_port + 1);
-    midi.sendto(packet_t(pb.start, pb.size()), address);
+    res = midi.sendto(packet_t(pb.start, pb.size()), address);
   } else {
     address.set_port(remote_base_port);
-    control.sendto(packet_t(pb.start, pb.size()), address);
+    res = control.sendto(packet_t(pb.start, pb.size()), address);
+  }
+  if (res < 0) {
+    // One line a minute, however many datagrams are lost (C7).
+    WARNING_RATE_LIMIT(60, "Server '{}': could not send to {}: {}", name,
+                       address.to_string(), strerror(errno));
   }
 }
 
-void rtpserver_t::create_peer_from(io_bytes_reader &&buffer,
-                                   const network_address_t &addr,
-                                   rtppeer_t::port_e port) {
-  peers.emplace_back(std::move(buffer), addr, port, name, this);
+rtpserverpeer_t &rtpserver_t::create_session(io_bytes_reader &&buffer,
+                                             const network_address_t &from,
+                                             int base_port,
+                                             rtppeer_t::port_e port) {
+  return peers.emplace_back(std::move(buffer), from, base_port, port, name,
+                            this);
 }
 
 rtpserverpeer_t *rtpserver_t::find_peer_data_by_id(int id) {
@@ -195,12 +263,6 @@ void rtpserver_t::send_midi_to_all_peers(const io_bytes_reader &buffer) {
 }
 
 void rtpserver_t::remove_peer(int peer_id) {
-  auto peerdata = find_peer_data_by_id(peer_id);
-  if (!peerdata)
-    return;
-
-  peers.erase(std::remove_if(peers.begin(), peers.end(),
-                             [peer_id](const rtpserverpeer_t &datapeer) {
-                               return datapeer.id == peer_id;
-                             }));
+  peers.remove_if(
+      [peer_id](const rtpserverpeer_t &datapeer) { return datapeer.id == peer_id; });
 }

@@ -15,11 +15,14 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #pragma once
 
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <rtpmidid/poller.hpp>
 #include <rtpmidid/rtppeer.hpp>
@@ -40,7 +43,8 @@ public:
   midi_event_t midi_event;
 
   int max_peer_data_id = 1;
-  std::vector<rtpserverpeer_t> peers;
+  // The sessions. A list: an element never moves (V4).
+  std::list<rtpserverpeer_t> peers;
 
   std::string name;
   udppeer_t control;
@@ -52,10 +56,10 @@ public:
   // NOLINTNEXTLINE(bugprone-exception-escape)
   ~rtpserver_t();
 
-  int port() { return control.get_address().port(); }
+  // V6: both ports bound. A server that is not open must not be announced.
+  bool is_open() const { return control.is_open() && midi.is_open(); }
+  int port() { return is_open() ? control.get_address().port() : 0; }
 
-  void create_peer_from(io_bytes_reader &&buffer, const network_address_t &addr,
-                        rtppeer_t::port_e port);
   void remove_peer(int peer_id);
 
   void send_midi_to_all_peers(const io_bytes_reader &bufer);
@@ -66,9 +70,16 @@ public:
               network_address_t &address, int remote_base_port);
 
   rtpserverpeer_t *find_peer_data_by_id(int id);
-  rtpserverpeer_t *find_peer_by_packet(io_bytes_reader &b,
-                                       rtppeer_t::port_e port);
-  rtpserverpeer_t *find_peer_by_initiator_id(uint32_t initiator_id);
-  rtpserverpeer_t *find_peer_by_ssrc(uint32_t ssrc);
+  // V1: the session a datagram from `from` on `port` with `ssrc` belongs to.
+  rtpserverpeer_t *find_session(const network_address_t &from,
+                                rtppeer_t::port_e port, uint32_t ssrc);
+
+private:
+  bool bind(const std::string &port);
+  void invitation(const io_bytes_reader &buffer, const network_address_t &from,
+                  rtppeer_t::port_e port);
+  rtpserverpeer_t &create_session(io_bytes_reader &&buffer,
+                                  const network_address_t &from, int base_port,
+                                  rtppeer_t::port_e port);
 };
 } // namespace rtpmidid

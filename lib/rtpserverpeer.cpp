@@ -15,34 +15,52 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
+#include <rtpmidid/logger.hpp>
 #include <rtpmidid/poller.hpp>
 #include <rtpmidid/rtpserver.hpp>
 #include <rtpmidid/rtpserverpeer.hpp>
 
 namespace rtpmidid {
 rtpserverpeer_t::rtpserverpeer_t(io_bytes_reader &&buffer,
-                                 const network_address_t &addr,
+                                 const network_address_t &addr, int base_port_,
                                  rtppeer_t::port_e port,
-                                 const std::string &name, rtpserver_t *srv) {
+                                 const std::string &name, rtpserver_t *srv)
+    : base_port(base_port_) {
   server = srv;
   id = server->max_peer_data_id++;
 
   peer = std::make_shared<rtppeer_t>(name);
 
-  DEBUG("Connected from {}", addr.to_string());
-  peer->remote_address = addr.dup();
-  peer->local_address = srv->control.get_address().dup();
-
   address = addr.dup();
+  address.set_port(base_port); // V3: the session is known by its base port
+  DEBUG("Connected from {} (base port {})", addr.to_string(), base_port);
+  peer->remote_address = address.dup();
+  peer->local_address = srv->control.get_address().dup();
 
   // Setup some callbacks
   setup_connections();
   // Finally pass the data to the peer
+  auto keep = peer;
   peer->data_ready(std::move(buffer), port);
 
   DEBUG("rtpserverpeer_t::rtpserverpeer_t({});", id);
+}
+
+std::string rtpserverpeer_t::label() const {
+  return FMT::format("{} ({}:{}, ssrc {:08X})", peer->remote_name,
+                     address.ip(), base_port, peer->remote_ssrc);
+}
+
+void rtpserverpeer_t::later(std::function<void()> f) {
+  std::weak_ptr<int> still = alive;
+  poller.call_later([still, f = std::move(f)] {
+    if (still.lock())
+      f();
+  });
 }
 
 void rtpserverpeer_t::setup_connections() {
@@ -57,21 +75,21 @@ void rtpserverpeer_t::setup_connections() {
   midi_event_connection = peer->midi_event.connect(
       [this](const io_bytes_reader &data) { server->midi_event(data); });
 
+  // V5: a session not complete 5 s after it was made is removed, whichever
+  // port it has (a MIDI-only one used to stay for good, answering clock sync).
   timer_connection = poller.add_timer_event(std::chrono::seconds(5), [this]() {
-    if (peer->status == rtppeer_t::status_e::CONTROL_CONNECTED) {
-      DEBUG("Timeout waiting for MIDI connection. Disconnecting.");
+    later([this] {
+      if (peer->status == rtppeer_t::status_e::CONNECTED)
+        return;
+      INFO("Incomplete session removed after 5 s: {}, status {}", label(),
+           peer->status);
+      auto keep = peer;
       peer->disconnect();
-    }
+    });
   });
 
   ck_event_connection =
       peer->ck_event.connect([this](float) { rearm_ck_timeout(); });
-}
-
-rtpserverpeer_t::rtpserverpeer_t(rtpserverpeer_t &&other) {
-  id = -1;
-  *this = std::move(other);
-  DEBUG("rtpserverpeer_t::rtpserverpeer_t({}) DUP;", id);
 }
 
 rtpserverpeer_t::~rtpserverpeer_t() {
@@ -84,36 +102,22 @@ rtpserverpeer_t::~rtpserverpeer_t() {
   id = -2;
 }
 
+// V4: no clock sync for 60 s ends the session.
 void rtpserverpeer_t::rearm_ck_timeout() {
   timer_connection.disable();
 
-  // If no signal in 60 secs, remove the peer
-  timer_connection = poller.add_timer_event(std::chrono::seconds(60),
-                                            [this]() { peer->disconnect(); });
-}
-
-rtpserverpeer_t &rtpserverpeer_t::operator=(rtpserverpeer_t &&other) {
-  DEBUG("rtpserverpeer_t::operator=({} -> {})", id, other.id);
-  this->id = other.id;
-  this->address = std::move(other.address);
-  this->server = std::move(other.server);
-  this->peer = std::move(other.peer);
-
-  other.send_event_connection.disconnect();
-  other.status_change_event_connection.disconnect();
-  other.ck_event_connection.disconnect();
-  other.midi_event_connection.disconnect();
-  other.timer_connection.disable();
-  other.id = -1;
-
-  setup_connections();
-
-  return *this;
+  timer_connection = poller.add_timer_event(std::chrono::seconds(60), [this]() {
+    later([this] {
+      WARNING("Session expired: {}, no clock sync for 60 s", label());
+      auto keep = peer;
+      peer->disconnect();
+    });
+  });
 }
 
 void rtpserverpeer_t::sendto(const io_bytes_reader &buff,
                              rtppeer_t::port_e port) {
-  server->sendto(buff, port, address, peer->remote_address.port());
+  server->sendto(buff, port, address, base_port);
 }
 
 void rtpserverpeer_t::status_change(rtppeer_t::status_e st) {
@@ -124,7 +128,7 @@ void rtpserverpeer_t::status_change(rtppeer_t::status_e st) {
     rearm_ck_timeout();
   } else if (rtppeer_t::is_disconnected(st)) {
     DEBUG("Remove from server the peer {}, status: {}", id, st);
-    server->remove_peer(id);
+    server->remove_peer(id); // destroys this object: nothing after this line
   }
 }
 } // namespace rtpmidid
