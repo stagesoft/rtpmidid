@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "argv.hpp"
@@ -167,19 +169,25 @@ int main(int argc, char **argv) {
   }
 
   // MAIN RUN
+  // M4 (D11): an exception that reaches here from the loop ends the process
+  // with status 1, so that the unit's Restart=on-failure starts it again (it
+  // used to end with 0 and stay down until someone noticed).
+  int status = 0;
   try {
     INFO("Waiting for connections.");
     while (rtpmidid::poller.is_open()) {
       rtpmidid::poller.wait();
     }
   } catch (const std::exception &exc) {
-    ERROR("Unhandled exception: {}!", exc.what());
+    ERROR("Unhandled exception: {}! Exiting with status 1.", exc.what());
+    status = 1;
   } catch (...) {
-    ERROR("Unhandled exception!");
+    ERROR("Unhandled exception! Exiting with status 1.");
+    status = 1;
   }
 
   maindata.close();
 
   INFO("FIN");
-  return 0;
+  return status;
 }

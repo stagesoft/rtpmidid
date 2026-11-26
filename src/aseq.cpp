@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 #include "./aseq.hpp"
 #include <alsa/seq.h>
@@ -245,7 +247,7 @@ void aseq_t::read_ready() {
   }
 }
 
-uint8_t aseq_t::create_port(const std::string &name, bool do_export) {
+int aseq_t::create_port(const std::string &name, bool do_export) {
   auto caps = SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE |
               SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ;
   auto type = SND_SEQ_TYPE_INET;
@@ -254,8 +256,11 @@ uint8_t aseq_t::create_port(const std::string &name, bool do_export) {
     caps |= SND_SEQ_PORT_CAP_NO_EXPORT;
   }
 
-  auto port = snd_seq_create_simple_port(seq, name.c_str(), caps, type);
-
+  int port = snd_seq_create_simple_port(seq, name.c_str(), caps, type);
+  if (port < 0) {
+    ERROR("Could not create ALSA port \"{}\": {} ({})", name,
+          snd_strerror(port), port);
+  }
   return port;
 }
 

@@ -14,10 +14,13 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "hwautoannounce.hpp"
 #include "aseq.hpp"
+#include "rtpmidid/exceptions.hpp"
 #include "local_alsa_multi_listener.hpp"
 #include "midirouter.hpp"
 #include "settings.hpp"
@@ -30,9 +33,12 @@ HwAutoAnnounce::HwAutoAnnounce(std::shared_ptr<aseq_t> aseq,
                                std::shared_ptr<midirouter_t> router)
     : router(router), aseq(aseq) {
 
-  auto ann_port = aseq->create_port("Announcements", false);
+  const int ann_port = aseq->create_port("Announcements", false);
+  if (ann_port < 0)
+    throw rtpmidid::exception("Could not create the ALSA port Announcements: {}",
+                              snd_strerror(ann_port));
   auto conn = aseq->connect(aseq_t::port_t{0, 1},
-                            aseq_t::port_t{aseq->client_id, ann_port});
+                            aseq_t::port_t{aseq->client_id, uint8_t(ann_port)});
   connections.push_back(std::move(conn));
 
   aseq->for_devices([&](uint8_t device_id, const std::string &device_name,

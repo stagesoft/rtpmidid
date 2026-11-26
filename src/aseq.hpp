@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #pragma once
@@ -114,7 +116,9 @@ public:
   std::string get_client_name(snd_seq_addr_t *addr);
   aseq_t::client_type_e get_client_type(snd_seq_addr_t *addr);
 
-  uint8_t create_port(const std::string &name, bool do_export = true);
+  // M2 (1amfwm7fgu7): the port number, or a negative alsa-lib error, logged
+  // here (it used to come back as a uint8_t, so an error looked like a port).
+  int create_port(const std::string &name, bool do_export = true);
   void remove_port(uint8_t port);
 
   /// Connect two ports

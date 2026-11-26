@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "midirouter.hpp"
@@ -28,6 +30,12 @@ midirouter_t::midirouter_t() {}
 midirouter_t::~midirouter_t() {}
 
 uint32_t midirouter_t::add_peer(std::shared_ptr<midipeer_t> peer) {
+  // M2 (1amfwm7fgu7): a peer that could not be made is refused, not
+  // dereferenced.
+  if (!peer) {
+    ERROR("Refusing to add a peer that does not exist");
+    return MIDIPEER_ID_INVALID;
+  }
   if (peer->peer_id) {
     WARNING("Peer already present!");
     return peer->peer_id;

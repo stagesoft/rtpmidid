@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "../src/aseq.hpp"
@@ -104,7 +106,10 @@ void test_send_receive_messages() {
   // 1. ALSA A connect to WR RTPMIDID
   INFO("1. ALSA A connect to WR RTPMIDID");
 
-  auto alsa_a = aseq->create_port("ALSA A");
+  // create_port returns an int, negative on error (1amfwm7fgu7, M2)
+  const int alsa_a_port = aseq->create_port("ALSA A");
+  ASSERT_GTE(alsa_a_port, 0);
+  const uint8_t alsa_a = uint8_t(alsa_a_port);
   int midi_packets_alsa_a = 0;
   auto midievent_listener_a = aseq->midi_event[alsa_a].connect(
       [&midi_packets_alsa_a](snd_seq_event_t *ev) {
@@ -210,7 +215,9 @@ void test_send_receive_messages() {
   INFO("6. Connect to/from ALSA B");
 
   ASSERT_NOT_EQUAL(aseq->client_id, device_id);
-  auto alsa_b_rw = aseq->create_port("ALSA B R/W");
+  const int alsa_b_rw_port = aseq->create_port("ALSA B R/W");
+  ASSERT_GTE(alsa_b_rw_port, 0);
+  const uint8_t alsa_b_rw = uint8_t(alsa_b_rw_port);
   auto alsa_a_to_b_connection =
       aseq->connect({aseq->client_id, alsa_b_rw}, {device_id, port_id_b});
   auto alsa_b_to_a_connection =
@@ -322,8 +329,12 @@ void test_midirouter_alsa_listener_lifecycle() {
 
   ASSERT_EQUAL(router->peers.size(), 1);
 
-  auto external_port1 = aseq_external->create_port("ext1");
-  auto external_port2 = aseq_external->create_port("ext2");
+  const int external_port1_id = aseq_external->create_port("ext1");
+  const int external_port2_id = aseq_external->create_port("ext2");
+  ASSERT_GTE(external_port1_id, 0);
+  ASSERT_GTE(external_port2_id, 0);
+  const uint8_t external_port1 = uint8_t(external_port1_id);
+  const uint8_t external_port2 = uint8_t(external_port2_id);
   rtpmididns::aseq_t::port_t external_device_port_1 = {aseq_external->client_id,
                                                        external_port1};
   rtpmididns::aseq_t::port_t external_device_port_2 = {aseq_external->client_id,

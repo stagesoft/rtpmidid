@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "network_rtpmidi_listener.hpp"
@@ -21,6 +23,7 @@
 #include "mididata.hpp"
 #include "midipeer.hpp"
 #include "midirouter.hpp"
+#include "rtpmidid/exceptions.hpp"
 #include "rtpmidid/iobytes.hpp"
 #include "rtpmidid/mdns_rtpmidi.hpp"
 #include "utils.hpp"
@@ -34,6 +37,13 @@ extern std::shared_ptr<::rtpmidid::mdns_rtpmidi_t> mdns;
 network_rtpmidi_listener_t::network_rtpmidi_listener_t(
     const std::string &name, const std::string &udp_port)
     : name_(name), server(name, udp_port) {
+  // V6 (1amfwm7fgu7): a server that could not bind is not announced, and it is
+  // not made: at start-up that fails the start, for an export made later the
+  // export is not made (the caller catches this).
+  if (!server.is_open())
+    throw rtpmidid::exception("RTP MIDI server {} could not bind port {}", name,
+                              udp_port.empty() ? std::string("(any)")
+                                               : udp_port);
   if (mdns)
     mdns->announce_rtpmidi(name, server.port());
 

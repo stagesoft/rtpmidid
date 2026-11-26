@@ -14,10 +14,13 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "local_alsa_multi_listener.hpp"
 #include "aseq.hpp"
+#include "rtpmidid/exceptions.hpp"
 #include "factory.hpp"
 #include "json.hpp"
 #include "local_alsa_peer.hpp"
@@ -38,7 +41,11 @@ local_alsa_multi_listener_t::local_alsa_multi_listener_t(
     const std::string &name_, std::shared_ptr<aseq_t> aseq_)
     : seq(aseq_), name(name_) {
 
-  port = seq->create_port(name);
+  const int created = seq->create_port(name);
+  if (created < 0)
+    throw rtpmidid::exception("Could not create the ALSA port {}: {}", name,
+                              snd_strerror(created));
+  port = uint8_t(created);
   subscribe_connection = seq->subscribe_event[port].connect(
       [this](aseq_t::port_t port, const std::string &name) {
         new_alsa_connection(port, name);
@@ -74,8 +81,15 @@ local_alsa_multi_listener_t::new_alsa_connection(const aseq_t::port_t &port,
       });
 
   if (networkpeer_id == MIDIPEER_ID_INVALID) {
-    std::shared_ptr<midipeer_t> networkpeer =
-        make_network_rtpmidi_listener(name, "");
+    std::shared_ptr<midipeer_t> networkpeer;
+    try {
+      networkpeer = make_network_rtpmidi_listener(name, "");
+    } catch (const std::exception &exc) {
+      // V6, M2: an export that cannot listen is not made; nothing leaves this
+      // ALSA event.
+      ERROR("Export {} not made: {}", name, exc.what());
+      return MIDIPEER_ID_INVALID;
+    }
     networkpeer_id = router->add_peer(networkpeer);
 
     aseqpeers[port] = networkpeer_id;

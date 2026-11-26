@@ -14,10 +14,13 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "local_alsa_peer.hpp"
 #include "aseq.hpp"
+#include "rtpmidid/exceptions.hpp"
 #include "json.hpp"
 #include "mididata.hpp"
 #include "midipeer.hpp"
@@ -29,7 +32,11 @@ using namespace rtpmididns;
 local_alsa_peer_t::local_alsa_peer_t(const std::string &name_,
                                      std::shared_ptr<aseq_t> seq_)
     : seq(seq_), name(name_) {
-  port = seq->create_port(name);
+  const int created = seq->create_port(name);
+  if (created < 0)
+    throw rtpmidid::exception("Could not create the ALSA port for {}: {}",
+                              name, snd_strerror(created));
+  port = uint8_t(created);
   INFO("Created alsapeer {}, port {}", name, port);
 
   midi_connection = seq->midi_event[port].connect([this](snd_seq_event *ev) {
