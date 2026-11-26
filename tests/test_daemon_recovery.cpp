@@ -253,7 +253,9 @@ void a_second_connected_makes_no_port() {
        count_peers<rtpmididns::local_alsa_peer_t>(*router));
   ASSERT_EQUAL(count_peers<rtpmididns::local_alsa_peer_t>(*router), 1);
 
+  // A session ends when it has said goodbye on both of its ports.
   control.send(hex_to_bin("FF FF 'BY' 0000 0002 00 12 34 00 00 BE EF 00"));
+  midi.send(hex_to_bin("FF FF 'BY' 0000 0002 00 12 34 00 00 BE EF 00"));
   run_for(200ms);
   INFO("ALSA peers after the goodbye: {}",
        count_peers<rtpmididns::local_alsa_peer_t>(*router));
