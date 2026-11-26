@@ -78,6 +78,23 @@ if (NOT LIBS_ONLY)
 endif (NOT LIBS_ONLY)
 
 
+#
+# DAEMON RECOVERY (1amfwm7fgu7, step 4): N3, M1, M2. Needs a sequencer (skips
+# without one).
+#
+
+if (NOT LIBS_ONLY)
+  add_executable(test_daemon_recovery
+      test_daemon_recovery.cpp test_utils.cpp
+  )
+  target_link_libraries(test_daemon_recovery -pthread rtpmidid-shared rtpmidid2-static)
+  add_test(NAME test_daemon_recovery COMMAND test_daemon_recovery)
+  target_link_libraries(test_daemon_recovery ${ALSA_LIBRARIES})
+  target_link_libraries(test_daemon_recovery ${FMT_LIBRARIES})
+  target_include_directories(test_daemon_recovery PUBLIC ${ALSA_INCLUDE_DIRS})
+  target_compile_options(test_daemon_recovery PUBLIC ${ALSA_CFLAGS_OTHER})
+endif (NOT LIBS_ONLY)
+
 # disabled as failing
 # add_test(NAME test_rtpmidid COMMAND test_rtpmidid)
 
