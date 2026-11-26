@@ -256,12 +256,14 @@ std::vector<std::string> rtpclient_t::addresses_of(const endpoint_t &endpoint) {
     auto ips = lookup_name(endpoint.hostname, endpoint.port, error);
     answer.looked_up = true;
     answer.looked_up_at = steady::now();
-    last_try = answer.looked_up_at; // a lookup is a try (C8)
-    tries_in_round++;
     if (!ips.empty()) {
+      // An answer: the attempt uses it in this turn (C1, its IN at once).
       answer.ips = std::move(ips);
       answer.all_failed = false;
     } else {
+      // A name with no answer is one lost try (C8).
+      last_try = answer.looked_up_at;
+      tries_in_round++;
       last_error = error;
       DEBUG("{}; keeping {} address(es) of the last answer", error,
             answer.ips.size());
