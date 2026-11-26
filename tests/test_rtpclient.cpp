@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "../tests/test_case.hpp"
@@ -411,8 +413,12 @@ void test_client_try_several_connections() {
         midi_remote_address = from.dup();
       });
 
-  client.connect_timeout = 200ms;
-  // all in one list. Connects in reverse order (uses back() its more efficient.
+  // One try a phase, 200 ms apart: the single-shot timing this test was
+  // written for (the client now repeats each IN once a tick, 1amfwm7fgu7).
+  client.tick = 200ms;
+  client.control_tries = 1;
+  client.midi_tries = 1;
+  // all in one list, tried in order, the endpoint of the last session first.
   client.add_server_addresses({
       {"localhost", "14001"},
       {"localhost", "14001"},

@@ -91,11 +91,10 @@ static uint64_t read_u64(const uint8_t *bytes) {
   return value;
 }
 
-// Timeouts short enough for a unit test. CK is kept slow so that the only CK
-// timeout in a test is the one the test asks for.
+// CK is kept slow so that the only CK timeout in a test is the one the test
+// asks for. (The 500 ms connect and reconnect timeouts written here for the
+// unfixed client are gone: the fixed one tries once a tick, 1 s.)
 static void fast_timeouts(rtpclient_t &client) {
-  client.connect_timeout = 500ms;
-  client.reconnect_timeout = 500ms;
   client.ck_short_period = 5000ms;
   client.ck_long_period = 5000ms;
 }
@@ -824,7 +823,6 @@ void one_lost_ck_does_not_end_the_session() {
   server.ignore_ck_requests = 1;
 
   rtpclient_t node("node");
-  node.connect_timeout = 4000ms; // the budget for one clock-sync exchange
   node.add_server_address("127.0.0.1", "15421");
 
   ASSERT_TRUE(run_until([&] { return server.ck_requests >= 1; }, 3000ms));
@@ -947,7 +945,6 @@ void a_late_ck_reply_during_a_handshake_changes_nothing() {
   fake_server_t server;
   rtpclient_t node("node");
   fast_timeouts(node);
-  node.reconnect_timeout = 5000ms; // a second attempt would show
   node.local_base_port_str = std::to_string(free_port_pair());
   connect_to_fake(node, server);
 

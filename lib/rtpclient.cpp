@@ -15,7 +15,10 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
+
 
 #include <rtpmidid/exceptions.hpp>
 #include <rtpmidid/logger.hpp>
@@ -25,9 +28,40 @@
 #include <rtpmidid/rtpclient.hpp>
 #include <rtpmidid/rtppeer.hpp>
 #include <rtpmidid/udppeer.hpp>
+#include <rtpmidid/utils.hpp>
+
+#include <algorithm>
+#include <cstring>
 
 using namespace std::chrono_literals;
 using namespace rtpmidid;
+
+using steady = std::chrono::steady_clock;
+
+static long seconds_since(steady::time_point when) {
+  return long(
+      std::chrono::duration_cast<std::chrono::seconds>(steady::now() - when)
+          .count());
+}
+
+// The blocking lookup of a name (C6: only for a `[connect_to]` name, never for
+// an address). Counted by network_address_list_t.
+static std::vector<std::string> getaddrinfo_lookup(const std::string &name,
+                                                   const std::string &port,
+                                                   std::string &error) {
+  std::vector<std::string> ips;
+  network_address_list_t list(name, port);
+  if (!list.is_valid()) {
+    error = FMT::format("lookup of {} failed: {}", name, list.error_string());
+    return ips;
+  }
+  for (auto address : list) {
+    auto ip = address.ip();
+    if (std::find(ips.begin(), ips.end(), ip) == ips.end())
+      ips.push_back(ip);
+  }
+  return ips;
+}
 
 /**
  * @short Create the rtp client
@@ -39,27 +73,21 @@ using namespace rtpmidid;
  *
  * There is an internal state machine that helps try all combinations of name
  * resolves to ensure connection. It can even connect control and then fail.
- * (TODO: add timer)
- *
  */
 rtpclient_t::rtpclient_t(const std::string name) : peer(std::move(name)) {
-  peer.initiator_id = ::rtpmidid::rand_u32();
+  lookup_name = getaddrinfo_lookup;
+  peer.initiator_id = ::rtpmidid::rand_u32_nonzero();
   send_connection = peer.send_event.connect([this](const io_bytes_reader &data,
                                                    rtppeer_t::port_e port) {
-    try {
-      this->sendto(data, port);
-    } catch (const network_exception &e) {
-      ERROR("Error sending data to {}. {}",
-            port == rtppeer_t::CONTROL_PORT
-                ? control_peer.get_address().to_string()
-                : midi_peer.get_address().to_string(),
-            e.what());
-      peer.status_change_event(rtppeer_t::status_e::DISCONNECTED_NETWORK_ERROR);
-    }
+    // A send that fails is reported to the try that made it (C8), not turned
+    // into a status event from inside the send.
+    this->sendto(data, port);
   });
+  ck_connection = peer.ck_event.connect([this](float) { on_ck_reply(); });
 }
 
 rtpclient_t::~rtpclient_t() {
+  timer.disable();
   if (peer.is_connected()) {
     try {
       peer.send_goodbye(rtppeer_t::CONTROL_PORT);
@@ -84,9 +112,13 @@ void rtpclient_t::sendto(const io_bytes &pb, rtppeer_t::port_e port) {
   }
 
   if (res == -1) {
-    ERROR("Client: Could not send all data to {}. Sent {}. {} ({})", port, res,
-          strerror(errno), errno);
-    throw network_exception(errno);
+    send_errno = errno;
+    last_error = FMT::format(
+        "send to {} failed: {}",
+        port == rtppeer_t::CONTROL_PORT ? control_address.to_string()
+                                        : midi_address.to_string(),
+        strerror(send_errno));
+    DEBUG("Client: {}", last_error);
   }
 }
 
@@ -108,9 +140,86 @@ void rtpclient_t::add_server_addresses(
   connect();
 }
 
+void rtpclient_t::replace_server_addresses(
+    const std::vector<rtpclient_t::endpoint_t> &endpoints) {
+  address_port_known.assign(endpoints.begin(), endpoints.end());
+  if (has_last_connected && !endpoint_known(last_connected))
+    has_last_connected = false;
+  rebuild_pending();
+  connect();
+}
+
 void rtpclient_t::connect() {
-  if (state == WaitToStart)
+  if (state == WaitToStart) {
+    // C7: a client is away from the start until its first session.
+    down_since = steady::now();
+    last_still_no_session = down_since;
     handle_event(Started);
+  }
+}
+
+bool rtpclient_t::endpoint_known(const endpoint_t &endpoint) const {
+  for (auto &known : address_port_known)
+    if (known.hostname == endpoint.hostname && known.port == endpoint.port)
+      return true;
+  return false;
+}
+
+// C6: the endpoint of the last session first, and again after each other one.
+void rtpclient_t::rebuild_pending() {
+  address_port_pending.clear();
+  const bool last = has_last_connected && endpoint_known(last_connected);
+  if (last)
+    address_port_pending.push_back(last_connected);
+  for (auto &endpoint : address_port_known) {
+    if (last && endpoint.hostname == last_connected.hostname &&
+        endpoint.port == last_connected.port)
+      continue;
+    address_port_pending.push_back(endpoint);
+    if (last)
+      address_port_pending.push_back(last_connected);
+  }
+}
+
+std::string rtpclient_t::peer_label() const {
+  const std::string name =
+      peer.remote_name.empty() ? std::string("?") : peer.remote_name;
+  return FMT::format("{} ({}:{})", name, resolve_next_dns_endpoint.hostname,
+                     resolve_next_dns_endpoint.port);
+}
+
+// C7: the session is away from now on (or has never been up).
+void rtpclient_t::note_down(const std::string &reason) {
+  if (peer.is_connected() || state == SendCkShort || state == SendCkLong ||
+      state == WaitSendCkShort || state == WaitSendCkLong ||
+      state == DisconnectBecauseCKTimeout) {
+    WARNING("Session lost: {}, reason: {}", peer_label(), reason);
+    session_lost = true;
+  }
+  down_since = steady::now();
+  last_still_no_session = down_since;
+  invitations_while_down = 0;
+}
+
+void rtpclient_t::still_no_session() {
+  if (steady::now() - last_still_no_session < still_no_session_period)
+    return;
+  last_still_no_session = steady::now();
+  WARNING("Still no session: {}, {} invitations in {} s, last error: {}",
+          peer_label(), invitations_while_down, seconds_since(down_since),
+          last_error.empty() ? std::string("none") : last_error);
+}
+
+// Everything that ends the current attempt goes through here: the next one
+// waits for a tick (C8, in state_connect_control).
+void rtpclient_t::attempt_failed(const std::string &why) {
+  DEBUG("Attempt to {} failed: {}", peer_label(), why);
+  timer.disable();
+  control_connected_event_connection.disconnect();
+  midi_connected_event_connection.disconnect();
+  if (!why.empty())
+    last_error = why;
+  handle_event(ConnectFailed);
 }
 
 ///
@@ -124,28 +233,61 @@ void rtpclient_t::state_prepare_next_dns() {
     handle_event(ConnectListExhausted);
     return;
   }
-  resolve_next_dns_endpoint = address_port_pending.back();
-  address_port_pending.pop_back();
+  resolve_next_dns_endpoint = address_port_pending.front();
+  address_port_pending.pop_front();
+  resolve_next_ips_valid = false;
 
   handle_event(NextReady);
 }
 
+// C6: an address is used as it is; a name is looked up only when it has no
+// answer, or when every address of its answer has failed an attempt, and then
+// no sooner than name_lookup_interval after the last lookup ended. A failed
+// lookup keeps the last good answer.
+std::vector<std::string> rtpclient_t::addresses_of(const endpoint_t &endpoint) {
+  if (network_address_list_t::is_numeric(endpoint.hostname))
+    return {endpoint.hostname};
+
+  auto &answer = name_answers[endpoint.hostname];
+  const bool due = !answer.looked_up ||
+                   steady::now() - answer.looked_up_at >= name_lookup_interval;
+  if (due && (answer.ips.empty() || answer.all_failed)) {
+    std::string error;
+    auto ips = lookup_name(endpoint.hostname, endpoint.port, error);
+    answer.looked_up = true;
+    answer.looked_up_at = steady::now();
+    last_try = answer.looked_up_at; // a lookup is a try (C8)
+    tries_in_round++;
+    if (!ips.empty()) {
+      answer.ips = std::move(ips);
+      answer.all_failed = false;
+    } else {
+      last_error = error;
+      DEBUG("{}; keeping {} address(es) of the last answer", error,
+            answer.ips.size());
+    }
+  }
+  return answer.ips;
+}
+
 void rtpclient_t::state_resolve_next_ip_port() {
-  // First time, get next address and resolve
-  if (!resolve_next_dns_sockaddress_list.is_valid()) {
-    resolve_next_dns_sockaddress_list = network_address_list_t(
-        resolve_next_dns_endpoint.hostname, resolve_next_dns_endpoint.port);
-    resolve_next_dns_sockaddress_list_I =
-        resolve_next_dns_sockaddress_list.begin();
+  // First time, get the addresses of this endpoint
+  if (!resolve_next_ips_valid) {
+    resolve_next_ips = addresses_of(resolve_next_dns_endpoint);
+    resolve_next_ip_index = 0;
+    resolve_next_ips_valid = true;
   } else {
-    // Following use the next resolved item
-    resolve_next_dns_sockaddress_list_I++;
+    // Following use the next address
+    resolve_next_ip_index++;
   }
 
   // If any left, go for it, if not failed resolve this address port pair
-  if (resolve_next_dns_sockaddress_list_I !=
-      resolve_next_dns_sockaddress_list.end()) {
-    control_address = (*resolve_next_dns_sockaddress_list_I).dup();
+  if (resolve_next_ip_index < resolve_next_ips.size()) {
+    const auto &ip = resolve_next_ips[resolve_next_ip_index];
+    control_address =
+        network_address_list_t(ip, resolve_next_dns_endpoint.port)
+            .get_first()
+            .dup();
 
     // Guard: a resolved entry with destination port 0 means the endpoint
     // had no port (getaddrinfo with service=NULL/""), or the resolver
@@ -153,10 +295,11 @@ void rtpclient_t::state_resolve_next_ip_port() {
     // (kernel returns EINVAL on every sendto), so refuse and advance to
     // the next resolved entry instead of letting the rtpclient_t enter a
     // permanent retry loop.
-    if (control_address.port() == 0) {
-      ERROR("Refusing endpoint {} - destination port is 0 (missing or "
-            "invalid port in [connect_to] config)",
-            control_address.to_string());
+    if (!control_address.is_valid() || control_address.port() == 0) {
+      WARNING_RATE_LIMIT(60,
+                         "Refusing endpoint {}:{} - destination port is 0 "
+                         "(missing or invalid port in [connect_to] config)",
+                         ip, resolve_next_dns_endpoint.port);
       handle_event(ResolveFailed);
       return;
     }
@@ -171,12 +314,35 @@ void rtpclient_t::state_resolve_next_ip_port() {
 
     handle_event(Resolved);
   } else {
-    resolve_next_dns_sockaddress_list = network_address_list_t();
+    resolve_next_ips_valid = false;
+    if (!network_address_list_t::is_numeric(resolve_next_dns_endpoint.hostname))
+      name_answers[resolve_next_dns_endpoint.hostname].all_failed = true;
     handle_event(ConnectListExhausted);
   }
 }
 
+// C1, C8: an attempt starts on a tick, never sooner than a tick after the last
+// try, whatever failed. The deferral is a whole tick: no timer of this client
+// is shorter.
 void rtpclient_t::state_connect_control() {
+  timer.disable();
+  // C6: an endpoint that was replaced meanwhile is not invited again.
+  if (!endpoint_known(resolve_next_dns_endpoint)) {
+    DEBUG("Endpoint {}:{} is no longer known, skipping it",
+          resolve_next_dns_endpoint.hostname, resolve_next_dns_endpoint.port);
+    handle_event(ConnectFailed);
+    return;
+  }
+  if (steady::now() - last_try + 5ms < tick) {
+    timer = poller.add_timer_event(tick, [this] { start_control_attempt(); });
+    return;
+  }
+  start_control_attempt();
+}
+
+void rtpclient_t::start_control_attempt() {
+  timer.disable();
+
   // Defensive: if a previous cycle (CK-timeout reconnect, etc.) left either
   // peer bound, close them before re-allocating. Without this, the kernel
   // could hand us the same ephemeral control port as last cycle, and our own
@@ -192,7 +358,7 @@ void rtpclient_t::state_connect_control() {
   //
   // Retry only when local_base_port_str == "0" (ephemeral). A fixed user-
   // configured local_udp_port that collides on +1 is a config error — fail
-  // with a clear message after one attempt.
+  // after one attempt, and say so in the once-a-minute line.
   static constexpr int MAX_PAIR_RETRIES = 5;
   const bool ephemeral = (local_base_port_str == "0");
   const int max_attempts = ephemeral ? MAX_PAIR_RETRIES : 1;
@@ -201,10 +367,10 @@ void rtpclient_t::state_connect_control() {
   for (int attempt = 0; attempt < max_attempts; attempt++) {
     control_peer.open(network_address_list_t("::", local_base_port_str));
     if (!control_peer.is_open()) {
-      ERROR("Could not open control socket (attempt {}/{}): {}:{}",
-            attempt + 1, max_attempts,
-            resolve_next_dns_endpoint.hostname,
-            resolve_next_dns_endpoint.port);
+      last_error = FMT::format("could not open the control socket ({}): {}",
+                               local_base_port_str,
+                               strerror(control_peer.get_errno()));
+      DEBUG("{} (attempt {}/{})", last_error, attempt + 1, max_attempts);
       continue;
     }
     local_base_port = control_peer.get_address().port();
@@ -216,61 +382,97 @@ void rtpclient_t::state_connect_control() {
       break;
     }
 
-    if (ephemeral) {
-      WARNING("Acquired control port {} but midi port {} is unavailable "
-              "(likely owned by another process); retrying with a fresh "
-              "ephemeral pair (attempt {}/{})",
-              local_base_port, local_base_port + 1, attempt + 1, max_attempts);
-    } else {
-      ERROR("Could not bind midi port {} (configured local_udp_port={}); "
-            "pick a different port where both (port, port+1) are free.",
-            local_base_port + 1, local_base_port_str);
-    }
+    last_error =
+        ephemeral
+            ? FMT::format("midi port {} after control port {} is taken",
+                          local_base_port + 1, local_base_port)
+            : FMT::format("could not bind midi port {} (configured "
+                          "local_udp_port={}); pick a port where both (port, "
+                          "port+1) are free",
+                          local_base_port + 1, local_base_port_str);
+    DEBUG("{} (attempt {}/{})", last_error, attempt + 1, max_attempts);
     control_peer.close();
   }
 
   if (!pair_acquired) {
-    ERROR("Could not allocate adjacent control/midi port pair after {} "
-          "attempt(s); last tried control={} midi={}",
-          max_attempts, local_base_port, local_base_port + 1);
-    handle_event(ConnectFailed);
+    // A bind that fails is one lost try (C8)
+    last_try = steady::now();
+    tries_in_round++;
+    still_no_session();
+    attempt_failed(last_error);
     return;
   }
 
+  // A new attempt: a new token and a new SSRC (C2, D8), the same for all the
+  // repetitions of this attempt.
+  peer.reset();
+  peer.initiator_id = ::rtpmidid::rand_u32_nonzero();
+  peer.local_ssrc = ::rtpmidid::rand_u32_nonzero();
+
   control_on_read_connection = control_peer.on_read.connect(
       [this](const packet_t &packet, const network_address_t &) {
-        DEBUG("Data ready for control!");
         io_bytes_reader data(packet.get_data(), packet.get_size());
         this->peer.data_ready(std::move(data), rtppeer_t::CONTROL_PORT);
       });
+  midi_on_read_connection.disconnect();
 
   control_connected_event_connection =
       peer.status_change_event.connect([this](rtppeer_t::status_e status) {
-        control_connected_event_connection.disconnect();
-        if (status != rtppeer_t::CONTROL_CONNECTED) {
-          // Speculatively-bound midi_peer is still open here — release it
-          // before bouncing back to ResolveNextIpPort.
-          midi_peer.close();
-          handle_event(ConnectFailed);
-          return;
+        if (status == rtppeer_t::CONTROL_CONNECTED) {
+          control_connected_event_connection.disconnect();
+          auto address = control_peer.get_address();
+          DEBUG("Connected control port {} to {}", address.port(),
+                control_address.to_string());
+          handle_event(Connected);
+        } else if (rtppeer_t::is_disconnected(status)) {
+          attempt_failed(FMT::format("invitation refused by {}",
+                                     control_address.to_string()));
         }
-
-        auto address = control_peer.get_address();
-        INFO("Connected control port {} to {}:{}", address.port(),
-             address.hostname(), address.port());
-        handle_event(Connected);
       });
 
-  timer = poller.add_timer_event(connect_timeout, [this] {
-    ERROR("Timeout connecting to control port");
-    control_connected_event_connection.disconnect();
-    // Speculatively-bound midi_peer is still open here — release it
-    // before bouncing back to ResolveNextIpPort.
-    midi_peer.close();
-    handle_event(ConnectFailed);
-  });
+  tries = 0;
+  send_invitation(rtppeer_t::CONTROL_PORT);
+}
 
-  peer.connect_to(rtppeer_t::CONTROL_PORT);
+// One try of the current phase: one IN, the next one a tick later (C1). A send
+// that fails ends the attempt (C8).
+void rtpclient_t::send_invitation(rtppeer_t::port_e port) {
+  tries++;
+  tries_in_round++;
+  last_try = steady::now();
+  if (port == rtppeer_t::CONTROL_PORT)
+    invitations_while_down++;
+  send_errno = 0;
+  peer.connect_to(port);
+  if (send_errno != 0) {
+    still_no_session();
+    if (port == rtppeer_t::MIDI_PORT) {
+      timer.disable();
+      midi_connected_event_connection.disconnect();
+      if (!last_error.empty())
+        DEBUG("{}", last_error);
+      handle_event(ConnectFailed); // to DisconnectControl
+    } else {
+      attempt_failed(last_error);
+    }
+    return;
+  }
+  still_no_session();
+  if (port == rtppeer_t::CONTROL_PORT)
+    timer = poller.add_timer_event(tick, [this] { on_control_tick(); });
+  else
+    timer = poller.add_timer_event(tick, [this] { on_midi_tick(); });
+}
+
+void rtpclient_t::on_control_tick() {
+  if (state != ConnectControl)
+    return;
+  if (tries < control_tries) {
+    send_invitation(rtppeer_t::CONTROL_PORT);
+    return;
+  }
+  attempt_failed(FMT::format("no answer from {} to {} invitations",
+                             control_address.to_string(), tries));
 }
 
 void rtpclient_t::state_connect_midi() {
@@ -288,30 +490,40 @@ void rtpclient_t::state_connect_midi() {
   midi_on_read_connection = midi_peer.on_read.connect(
       [this](const packet_t &packet, const network_address_t &) {
         io_bytes_reader data(packet.get_data(), packet.get_size());
-        // DEBUG("Data ready for midi!");
         this->peer.data_ready(std::move(data), rtppeer_t::MIDI_PORT);
       });
 
   midi_connected_event_connection =
       peer.status_change_event.connect([this](rtppeer_t::status_e status) {
-        midi_connected_event_connection.disconnect();
-        if (status != rtppeer_t::CONNECTED) {
+        if (status == rtppeer_t::CONNECTED) {
+          midi_connected_event_connection.disconnect();
+          timer.disable();
+          handle_event(Connected);
+        } else if (rtppeer_t::is_disconnected(status)) {
+          midi_connected_event_connection.disconnect();
+          timer.disable();
+          last_error = FMT::format("MIDI invitation refused by {}",
+                                   midi_address.to_string());
           handle_event(ConnectFailed);
-          return;
         }
-        auto address = midi_peer.get_address();
-        // DEBUG("Connected midi port {} to {}:{}", address.port(),
-        //       address.hostname(), address.port());
-        handle_event(Connected);
       });
-  timer = poller.add_timer_event(5s, [this] {
-    ERROR("Timeout connecting to midi port");
-    control_connected_event_connection.disconnect();
-    handle_event(ConnectFailed);
-  });
 
-  // event
-  peer.connect_to(rtppeer_t::MIDI_PORT);
+  // The first MIDI IN leaves at once, in the turn of the control OK (C1).
+  tries = 0;
+  send_invitation(rtppeer_t::MIDI_PORT);
+}
+
+void rtpclient_t::on_midi_tick() {
+  if (state != ConnectMidi)
+    return;
+  if (tries < midi_tries) {
+    send_invitation(rtppeer_t::MIDI_PORT);
+    return;
+  }
+  midi_connected_event_connection.disconnect();
+  last_error = FMT::format("no answer from {} to {} MIDI invitations",
+                           midi_address.to_string(), tries);
+  handle_event(ConnectFailed);
 }
 
 void rtpclient_t::state_disconnect_control() {
@@ -320,37 +532,93 @@ void rtpclient_t::state_disconnect_control() {
   control_peer.close();
   // With speculative midi_peer binding in state_connect_control, midi_peer is
   // open by the time we reach this state via the ConnectMidi failure path.
-  // Without this close it stays bound for up to reconnect_timeout.
   midi_peer.close();
   handle_event(ConnectFailed);
 }
 
 void rtpclient_t::state_all_connected() {
-  INFO("Connected");
+  timer.disable();
   peer.remote_address = control_address.dup();
   peer.local_address = control_peer.get_address().dup();
 
-  timer.disable();
+  has_last_connected = true;
+  last_connected = resolve_next_dns_endpoint;
+  if (session_lost) {
+    INFO("Session restored: {} after {} s", peer_label(),
+         seconds_since(down_since));
+  } else {
+    INFO("Connected to {}", peer_label());
+  }
+  session_lost = false;
+  down_since = steady::time_point{};
+  invitations_while_down = 0;
+  last_error.clear();
+
   ck_count = 0;
   handle_event(SendCK);
 }
 
-void rtpclient_t::state_send_ck_short() {
-  timer = poller.add_timer_event(connect_timeout,
-                                 [this] { handle_event(Timeout); });
-  ck_connection = peer.ck_event.connect([this](float ms) {
-    timer.disable();
+// C4: one clock-sync exchange: CK0 at once and again each tick while no reply
+// has come; ten tries (D1), each armed when the one before it is sent, so a
+// stalled loop costs one try however long it lasts.
+void rtpclient_t::start_ck_exchange() {
+  in_ck_exchange = true;
+  tries = 0;
+  send_ck0_try();
+}
+
+void rtpclient_t::send_ck0_try() {
+  tries++;
+  last_try = steady::now();
+  send_errno = 0;
+  peer.send_ck0(); // a send that fails is a lost try, nothing more (C8)
+  timer = poller.add_timer_event(tick, [this] { on_ck_tick(); });
+}
+
+void rtpclient_t::on_ck_tick() {
+  if (!in_ck_exchange || (state != SendCkShort && state != SendCkLong))
+    return;
+  if (tries < ck_tries) {
+    send_ck0_try();
+    return;
+  }
+  // D10: MIDI from the server's SSRC lately: the server still has the session,
+  // only the replies are lost. The verdict waits, the tries go on.
+  if (peer.last_midi_at != steady::time_point{} &&
+      steady::now() - peer.last_midi_at < midi_postpones_verdict) {
+    DEBUG("Clock sync unanswered after {} tries, but MIDI keeps coming: "
+          "verdict postponed",
+          tries);
+    send_ck0_try();
+    return;
+  }
+  in_ck_exchange = false;
+  handle_event(Timeout);
+}
+
+// A CK1 to any CK0 of the exchange ends it (C4); outside an exchange it changes
+// nothing (C3: the peer does not even report it).
+void rtpclient_t::on_ck_reply() {
+  if (!in_ck_exchange)
+    return;
+  if (state != SendCkShort && state != SendCkLong)
+    return;
+  in_ck_exchange = false;
+  timer.disable();
+  if (state == SendCkShort) {
     if (ck_count < 6) {
       handle_event(WaitSendCK);
     } else {
       handle_event(LatencyMeasured);
     }
-    ck_connection = peer.ck_event.connect([](float ms) {
-      WARNING("OUT OF ORDER CK0 received, latency: {} ms", ms);
-    });
-  });
+  } else {
+    handle_event(WaitSendCK);
+  }
+}
+
+void rtpclient_t::state_send_ck_short() {
   ck_count++;
-  peer.send_ck0();
+  start_ck_exchange();
 }
 
 void rtpclient_t::state_wait_send_ck_short() {
@@ -360,41 +628,46 @@ void rtpclient_t::state_wait_send_ck_short() {
 
 void rtpclient_t::state_send_ck_long() {
   ck_count++;
-  peer.send_ck0();
-  timer = poller.add_timer_event(connect_timeout,
-                                 [this] { handle_event(Timeout); });
-  ck_connection = peer.ck_event.connect([this](float ms) {
-    timer.disable();
-    handle_event(WaitSendCK);
-    ck_connection = peer.ck_event.connect([](float ms) {
-      WARNING("OUT OF ORDER CK0 received, latency: {} ms", ms);
-    });
-  });
+  start_ck_exchange();
 }
 
 void rtpclient_t::state_wait_send_ck_long() {
-  ck_connection.disconnect();
   timer =
       poller.add_timer_event(ck_long_period, [this] { handle_event(SendCK); });
 }
 
 void rtpclient_t::state_disconnect_because_cktimeout() {
-  INFO("Disconnecting because of CK timeout");
+  timer.disable();
+  in_ck_exchange = false;
+  note_down(FMT::format("clock sync unanswered after {} tries", tries));
+  last_error = "clock sync unanswered";
   peer.disconnect();
+  // The next attempt goes to the same endpoint first (C6), a tick after the
+  // last CK0 (C8, in state_connect_control).
   handle_event(ConnectFailed);
 }
 
+// Every endpoint was tried. The next round starts at once when this round made
+// a try and the last one is a tick old (the attempt that just ran out of tries:
+// its next IN is due now, C1); otherwise a tick later, so that a round that
+// could try nothing (a name with no answer yet) never turns in a loop (C8).
 void rtpclient_t::state_error() {
+  timer.disable();
   peer.disconnect();
-  ERROR("Error at rtpclient_t. Can't connect or disconnected. Will try to "
-        "connect again in {}ms",
-        reconnect_timeout.count());
-  timer = poller.add_timer_event(reconnect_timeout,
-                                 [this] { handle_event(Connect); });
+  still_no_session();
+  if (tries_in_round > 0 && steady::now() - last_try + 5ms >= tick) {
+    DEBUG("rtpclient_t: every endpoint tried, next round now");
+    handle_event(Connect);
+    return;
+  }
+  DEBUG("rtpclient_t: every endpoint tried, next round in {} ms",
+        tick.count());
+  timer = poller.add_timer_event(tick, [this] { handle_event(Connect); });
 }
 
 void rtpclient_t::state_try_connect_to_all_known_dns() {
-  address_port_pending = address_port_known;
+  rebuild_pending();
+  tries_in_round = 0;
   handle_event(Connect);
 }
 
