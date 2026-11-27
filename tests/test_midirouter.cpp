@@ -14,6 +14,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileContributor: Ion Reguera <ion@stagelab.coop>
  */
 
 #include "../src/aseq.hpp"
@@ -85,6 +87,8 @@ rtpmididns::make_network_rtpmidi_listener(const std::string &name,
 //   return std::make_shared<test_midiio_t>();
 // }
 
+// The router holds its peers and each peer holds the router (midipeer_t::router): every test ends with
+// router->clear(), which breaks that cycle, so the objects are freed (1amfwm7fgu7, AC4).
 void test_basic_midirouter() {
   auto router = std::make_shared<rtpmididns::midirouter_t>();
   auto peera = std::make_shared<test_midiio_t>();
@@ -102,6 +106,7 @@ void test_basic_midirouter() {
 
   DEBUG("GOT {} bytes", peerb->writer.pos());
   ASSERT_EQUAL(peerb->writer.pos(), 3);
+  router->clear();
 }
 
 void test_midirouter_from_alsa() {
@@ -149,6 +154,7 @@ void test_midirouter_from_alsa() {
   // rtppeer->writer.print_hex();
   ASSERT_TRUE(rtppeer);
   ASSERT_EQUAL(rtppeer->writer.pos(), 3);
+  router->clear();
 }
 
 void test_midirouter_for_each_peer() {
@@ -188,6 +194,7 @@ void test_midirouter_for_each_peer() {
         ASSERT_EQUAL((void *)peer, (void *)alsanetwork.get());
       });
   ASSERT_EQUAL(count, 1);
+  router->clear();
 }
 
 class test_signal_t : public rtpmididns::midipeer_t {
@@ -249,6 +256,7 @@ void test_connect_disconnect_signals() {
   router->remove_peer(peera->peer_id);
   ASSERT_EQUAL(peera->connections, 0);
   ASSERT_EQUAL(peerb->connections, 0);
+  router->clear();
 }
 
 int main(int argc, char **argv) {
